@@ -20,17 +20,26 @@
 // ---------------------------------------------------------------------------
 // CODEGEN STATUS, measured with this compiler on 2026-09-20, not claimed:
 //
-// `t27c gen` CANNOT produce this server, and the generator does not use it.
-//   - The only backends are Zig and Verilog. There is no Python, no JavaScript,
-//     no HTTP emitter, so an executable MCP server in t27 is not available to
-//     be written today.
-//   - Any function body containing `if`, `match` or `switch` is replaced with
-//     @compileError("not yet implemented") -- 3 of 3 such bodies in
-//     specs/mcp/server_registry.t27.
-//   - The Zig backend drops the quotes from a string literal:
-//     `pub const NAME: str = "mail_list";` lowers to
-//     `pub const NAME: str = mail_list;`, which is not valid Zig.
-//     (bootstrap/src/main.rs, NodeKind::ExprLiteral => node.value.clone())
+// Two claims that stood here when this file was first committed were WRONG, and
+// are corrected rather than quietly deleted:
+//   - It said "the only backends are Zig and Verilog. There is no Python, no
+//     JavaScript." `t27c --help` lists `gen`, `gen-verilog`, `gen-c` and
+//     `gen-rust`, plus the BitNet/FPGA/TinyTapeout emitters. A JavaScript
+//     backend, `gen-js`, now exists too (bootstrap/src/codegen_js.rs).
+//   - It said any function body containing `if`, `match` or `switch` becomes
+//     @compileError("not yet implemented"). That is the ZIG backend only.
+//     `gen-rust` lowers the same body into real Rust control flow.
+//
+// What is actually true, and is why this generator reads the AST instead of a
+// backend: there is no PYTHON backend, and this server is Python. The one
+// defect that was real is backend-independent -- every emitter printed a string
+// literal without its quotes:
+//     gen-rust  -> pub const NAME: String = mail_list;
+//     gen (Zig) -> pub const NAME: str = mail_list;
+//     gen-c     -> #define NAME mail_list
+// The information was never lost: the parser already records `extra_kind:
+// "string"` on the literal and it survives into `t27c parse --json`. The
+// emitters simply did not read it.
 //
 // `t27c parse --json` IS faithful where codegen is not, so that is what the
 // generator consumes: constant names, types and literal values; enum names and
