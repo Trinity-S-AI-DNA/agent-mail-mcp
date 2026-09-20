@@ -66,7 +66,39 @@ fi
 
 if [ "${1:-}" = "--list-chats" ]; then
   CURRENT="$(read_secret telegram_chat_id)"
-  [ -n "${CURRENT}" ] && echo "${CURRENT}" || echo "(no recipients configured)"
+  OWNER="$(read_secret telegram_owner_id)"
+  [ -n "${CURRENT}" ] && echo "feed:  ${CURRENT}" || echo "feed:  (no recipients configured)"
+  if [ -n "${OWNER}" ]; then
+    echo "owner: ${OWNER}"
+  elif [ -n "${CURRENT}" ] && [ "${CURRENT#*,}" = "${CURRENT}" ]; then
+    echo "owner: ${CURRENT}  (the only recipient, by default)"
+  else
+    echo "owner: (none -- nobody can reply or send; $0 --set-owner <id>)"
+  fi
+  exit 0
+fi
+
+# Receiving the feed and commanding the mailbox are different powers. An owner
+# can reply, send, and drive the job loop; everyone else on the feed can only
+# read. With one recipient the distinction is empty and the default covers it;
+# the moment a second agent is added, the choice has to be made explicitly,
+# because the alternative is guessing which chat may write as the mailbox.
+if [ "${1:-}" = "--set-owner" ]; then
+  TARGET="${2:-}"
+  [ -n "${TARGET}" ] || { echo "Usage: $0 --set-owner <chat-id>[,<chat-id>...]" >&2; exit 1; }
+  case "${TARGET}" in
+    ''|*[!0-9,-]*) echo "A chat id is digits, optionally leading '-' for a group." >&2; exit 1 ;;
+  esac
+  FEED="$(read_secret telegram_chat_id)"
+  for c in ${TARGET//,/ }; do
+    case ",${FEED}," in
+      *",$c,"*) ;;
+      *) echo "Chat $c is not on the feed. Add it first: $0 --add-chat $c" >&2; exit 1 ;;
+    esac
+  done
+  store_secret telegram_owner_id "${TARGET}"
+  echo "Owner is now: ${TARGET}"
+  echo "Everyone else on the feed keeps read-only access."
   exit 0
 fi
 
@@ -138,13 +170,36 @@ store_secret telegram_bot_token "${BOT_TOKEN}"
 store_secret telegram_chat_id "${CHAT_ID}"
 unset BOT_TOKEN
 
+# With one chat there is nothing to choose. With several, the script must not
+# pick for you: the owner is the chat allowed to send mail as this mailbox, and
+# the discovery order above is the order people happened to press Send in.
+if [ "${CHAT_ID#*,}" = "${CHAT_ID}" ]; then
+  store_secret telegram_owner_id "${CHAT_ID}"
+  echo "Owner (may reply and send): ${CHAT_ID}"
+else
+  echo "Several chats are on the feed: ${CHAT_ID}"
+  echo
+  echo "Which of them is YOURS? That chat may reply, send mail and drive the"
+  echo "job campaign. The others receive the feed and can only read."
+  read -r -p "Owner chat id (blank = decide later): " OWNER_ID
+  if [ -n "${OWNER_ID}" ]; then
+    store_secret telegram_owner_id "${OWNER_ID}"
+    echo "Owner: ${OWNER_ID}"
+  else
+    echo "No owner set. Until you run '$0 --set-owner <id>' the bridge only"
+    echo "delivers mail -- no chat can reply or send."
+  fi
+fi
+
+echo
 echo "Stored in the keyring under service '${SERVICE}'."
 echo
 echo "Test it:        ./mailbot.py --test"
 echo "One sweep:      ./mailbot.py --once"
-echo "Keep watching:  ./mailbot.py --watch"
+echo "Two-way:        ./mailbot.py --watch     (mail out, commands back)"
 echo
 echo "Add a recipient later:  $0 --add-chat <id>"
+echo "Choose the owner:       $0 --set-owner <id>"
 echo "List them:              $0 --list-chats"
 echo
 echo "The first sweep announces nothing: it records where the mailbox is now and"

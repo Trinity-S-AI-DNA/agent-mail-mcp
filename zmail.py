@@ -64,6 +64,10 @@ SECRETS = {
     "refresh_token":     (KEYCHAIN_SERVICE, "ZOHO_REFRESH_TOKEN", "Run ./bootstrap.sh"),
     "telegram_bot_token": (BRIDGE_SERVICE, "TELEGRAM_BOT_TOKEN", "Run ./bridge-setup.sh"),
     "telegram_chat_id":   (BRIDGE_SERVICE, "TELEGRAM_CHAT_ID",   "Run ./bridge-setup.sh"),
+    # Not a secret, and stored here anyway: it is the answer to "who may send
+    # mail as this mailbox", which belongs next to the credential it authorises
+    # rather than in a config file any process can rewrite.
+    "telegram_owner_id":  (BRIDGE_SERVICE, "TELEGRAM_OWNER_ID",  "Run ./bridge-setup.sh --set-owner <id>"),
 }
 
 

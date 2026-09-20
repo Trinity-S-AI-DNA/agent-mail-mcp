@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Push new mail into a Telegram chat as it arrives.
+"""Run the mailbox from a Telegram chat: new mail out, instructions back.
+
+Outbound, this file: every new message in the Inbox arrives in the chat with a
+preview and a keyboard. Inbound, botops.py: the buttons and commands come back
+as replies, searches and sends. `--watch` drives both in one process, so the
+bridge is a conversation rather than a feed.
+
+Nothing is ever sent on this bridge without the owner pressing send. The draft
+is written for them, they may rewrite it, and only then does it leave. See the
+header of botops.py for why that ordering is the whole defence.
 
 Why polling and not IMAP IDLE: Zoho disables IMAP/POP for Free-plan accounts
 created after 2024, so on the mailbox this was built against IDLE is not merely
@@ -15,7 +24,8 @@ notifications for old mail gets muted within the minute, and a muted bridge is
 worse than no bridge: it looks like it is working.
 
     ./mailbot.py --once      one sweep, then exit      (for cron / launchd)
-    ./mailbot.py --watch     stay running, poll forever
+    ./mailbot.py --watch     stay running: mail out, commands back
+    ./mailbot.py --feed-only with --watch, push mail but ignore every command
     ./mailbot.py --test      send one probe message and exit
     ./mailbot.py --status    what is configured, without secrets
 
@@ -28,47 +38,20 @@ import argparse
 import html
 import json
 import os
+import shutil
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import botops  # noqa: E402  -- the inbound half
+import tgapi  # noqa: E402   -- transport, state, and who may act
 import zmail  # noqa: E402  -- same directory, one implementation of the mail API
+from tgapi import load_state, log, recipients, save_state, telegram  # noqa: E402
 
-STATE_PATH = os.path.expanduser("~/.cache/zoho-mail-agent/bridge-state.json")
 INBOX_TYPE = "Inbox"
 DEFAULT_INTERVAL = 30
 PREVIEW_CHARS = 400
-
-# Telegram rejects a sendMessage over 4096 characters outright. Leave room for the
-# header lines and the HTML entities a subject can expand into.
-TELEGRAM_LIMIT = 3500
-
-
-def log(msg: str):
-    """Timestamped, on stderr, so --watch output can be tailed and stdout stays JSON."""
-    sys.stderr.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
-    sys.stderr.flush()
-
-
-def load_state() -> dict:
-    try:
-        with open(STATE_PATH) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
-
-
-def save_state(state: dict):
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=2)
-    # Atomic replace: a bridge killed mid-write would otherwise come back to a
-    # truncated state file, read it as "first run", and re-announce the inbox.
-    os.replace(tmp, STATE_PATH)
+TELEGRAM_LIMIT = tgapi.TELEGRAM_LIMIT
 
 
 def inbox_folder_id(aid: str) -> str:
@@ -76,33 +59,6 @@ def inbox_folder_id(aid: str) -> str:
         if d.get("folderType") == INBOX_TYPE:
             return d["folderId"]
     zmail.die("no Inbox folder found on this account")
-
-
-def telegram(method: str, payload: dict) -> dict:
-    token = zmail.keychain("telegram_bot_token")
-    url = f"https://api.telegram.org/bot{token}/{method}"
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), method="POST",
-        headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode()[:400]
-        # The token is in the URL, so the URL must never reach a log or an error.
-        if e.code in (401, 404):
-            zmail.die(
-                f"Telegram rejected the bot token (HTTP {e.code}). The token is wrong, "
-                f"revoked, or was stored with a stray space. Re-run ./bridge-setup.sh.\n"
-                f"Telegram said: {detail}")
-        if e.code == 400 and "chat not found" in detail.lower():
-            zmail.die(
-                "Telegram says 'chat not found'. The bot cannot open a conversation on "
-                "its own: send it any message in Telegram first, then re-run "
-                "./bridge-setup.sh to pick up the chat id.")
-        zmail.die(f"Telegram HTTP {e.code}: {detail}")
-    except OSError as e:
-        raise RuntimeError(f"Telegram unreachable: {e}") from e
 
 
 def render(m: dict) -> str:
@@ -141,31 +97,26 @@ def render(m: dict) -> str:
     return out[:TELEGRAM_LIMIT] if len(out) > TELEGRAM_LIMIT else out
 
 
-def recipients() -> list[str]:
-    """The chat ids to deliver to, in configured order.
+def notify(chat_id: str, text: str, mid: str | None = None):
+    """Deliver one notification, with the keyboard that makes it actionable.
 
-    One mailbox can feed several agents, so the stored value is a list: ids
-    separated by commas or whitespace. A single id -- what bridge-setup.sh has
-    always written -- parses to a list of one, so existing installs are
-    unaffected.
+    The buttons are attached for every recipient, not only owners: an observer
+    who presses one is told the feed is read-only, which is a clearer answer
+    than a message that silently has no buttons on one phone and buttons on
+    another. The authority check lives in botops, at the point of action.
     """
-    raw = zmail.keychain("telegram_chat_id") or ""
-    ids = [c.strip() for c in raw.replace(",", " ").split()]
-    ids = [c for c in ids if c]
-    if not ids:
-        zmail.die("no telegram_chat_id configured; run ./bridge-setup.sh")
-    # Deduplicate while keeping order: the same chat listed twice would receive
-    # every mail twice, and the second copy looks like a bridge malfunction.
-    return list(dict.fromkeys(ids))
-
-
-def notify(chat_id: str, text: str):
-    telegram("sendMessage", {
+    payload: dict = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
-    })
+    }
+    if mid is not None:
+        payload["reply_markup"] = {"inline_keyboard": [[
+            {"text": "✍️ Ответить", "callback_data": f"r|{mid}"},
+            {"text": "📄 Полностью", "callback_data": f"b|{mid}"},
+        ]]}
+    telegram("sendMessage", payload)
 
 
 def migrate_seen(state: dict, chats: list[str]) -> dict:
@@ -227,7 +178,7 @@ def sweep(aid: str, folder: str, state: dict, limit: int = 25) -> int:
         fresh = [m for m in reversed(msgs) if str(m["messageId"]) not in known]
         for m in fresh:
             try:
-                notify(chat, text_for(m))
+                notify(chat, text_for(m), str(m["messageId"]))
             except RuntimeError as e:
                 # Network blip: leave it unseen so the next sweep retries it for
                 # THIS chat only. Marking it seen here would silently drop the
@@ -261,13 +212,14 @@ def main():
     g.add_argument("--status", action="store_true", help="show configuration, no secrets")
     g.add_argument("--reset", action="store_true", help="forget state; next run re-baselines")
     ap.add_argument("-i", "--interval", type=int, default=DEFAULT_INTERVAL,
-                    help=f"seconds between polls with --watch (default {DEFAULT_INTERVAL})")
+                    help=f"seconds between mail polls with --watch (default {DEFAULT_INTERVAL})")
+    ap.add_argument("--feed-only", action="store_true",
+                    help="with --watch: push mail, ignore every incoming command")
     a = ap.parse_args()
 
     if a.status:
         state = load_state()
-        raw = zmail.keychain("telegram_chat_id", required=False) or ""
-        chats = [c for c in (x.strip() for x in raw.replace(",", " ").split()) if c]
+        chats = tgapi.recipients(required=False)
         seen = state.get("seen")
         # A chat id is not a secret -- it is the address of a conversation this
         # machine already delivers to -- and with several recipients the whole
@@ -281,19 +233,29 @@ def main():
             "recipients": chats,
             "recipient_count": len(chats),
             "keychain_service": zmail.BRIDGE_SERVICE,
-            "state_path": STATE_PATH,
+            "state_path": tgapi.STATE_PATH,
             "initialised": bool(state.get("initialised")),
             "seen_count_per_chat": per_chat,
             "state_format": "per-chat" if isinstance(seen, dict) else "legacy-single-chat",
             "last_sweep": state.get("last_sweep"),
             "poll_interval_sec": a.interval,
+            # The two-way half. `owners` is who may reply and send; everyone
+            # else on the feed can only read. Empty with several recipients and
+            # no explicit choice means nobody can act -- which is a setup step
+            # left undone, not a malfunction, and worth seeing here.
+            "owners": tgapi.owners(),
+            "commands_enabled": not a.feed_only,
+            "draft_engine": botops.draft_engine(),
+            "job_cli": shutil.which("tri"),
+            "drafts_pending": len(state.get("drafts") or {}),
+            "telegram_offset": state.get("tg_offset", 0),
         }, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
         return
 
     if a.reset:
         try:
-            os.remove(STATE_PATH)
+            os.remove(tgapi.STATE_PATH)
             log("state cleared; the next run re-baselines and announces nothing")
         except FileNotFoundError:
             log("no state to clear")
@@ -307,9 +269,13 @@ def main():
         ok, bad = [], []
         for chat in recipients():
             try:
+                role = "вы владелец: можно отвечать и отправлять" if tgapi.is_owner(chat) \
+                    else "лента только для чтения"
                 telegram("sendMessage", {
                     "chat_id": chat,
-                    "text": "✅ <b>Мост почты подключён.</b>\nНовые письма на admin@t27.ai будут приходить сюда.",
+                    "text": ("✅ <b>Мост почты подключён.</b>\n"
+                             "Новые письма на admin@t27.ai будут приходить сюда.\n"
+                             f"<i>{role}</i>\n\n/help — что умеет мост."),
                     "parse_mode": "HTML",
                 })
                 ok.append(chat)
@@ -330,15 +296,40 @@ def main():
         sweep(aid, folder, load_state())
         return
 
-    log(f"watching Inbox every {a.interval}s; Ctrl-C to stop")
+    if a.feed_only:
+        log(f"watching Inbox every {a.interval}s, commands disabled; Ctrl-C to stop")
+    else:
+        owners = tgapi.owners()
+        who = ", ".join(owners) if owners else \
+            "NOBODY -- run ./bridge-setup.sh --set-owner <id>"
+        log(f"watching Inbox every {a.interval}s; commands accepted from {who}")
+
+    # One loop, two clocks. Telegram is long-polled, which costs nothing while
+    # idle and makes a button press feel immediate; the mailbox is polled on the
+    # slower interval because Zoho gives no push. Sharing one thread keeps a
+    # single state file writer, so a draft and a sweep can never race.
+    last = 0.0
     while True:
+        state = load_state()
+        if time.monotonic() - last >= a.interval:
+            try:
+                sweep(aid, folder, state)
+            except SystemExit:
+                raise
+            except Exception as e:  # noqa: BLE001 -- a watcher that dies on a blip is useless
+                log(f"sweep failed, retrying next interval: {e}")
+            last = time.monotonic()
+
+        if a.feed_only:
+            time.sleep(min(a.interval, 5))
+            continue
         try:
-            sweep(aid, folder, load_state())
+            botops.poll(aid, folder, state, timeout=max(5, min(25, a.interval)))
         except SystemExit:
             raise
-        except Exception as e:  # noqa: BLE001 -- a watcher that dies on a blip is useless
-            log(f"sweep failed, retrying next interval: {e}")
-        time.sleep(a.interval)
+        except Exception as e:  # noqa: BLE001
+            log(f"command poll failed, continuing: {e}")
+            time.sleep(5)
 
 
 if __name__ == "__main__":
