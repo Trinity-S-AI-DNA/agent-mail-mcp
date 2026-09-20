@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Read-only Zoho Mail access for agents. No browser, no UI, no password in sight.
+"""Zoho Mail access for agents. No browser, no UI, no password in sight.
 
 Credentials live in the macOS Keychain under service `zoho-mail-agent` and are read
-on demand; nothing is written to this repo and nothing is echoed to stdout. The OAuth
-scopes are read-only by construction (see README.md), so an agent holding
-this tool cannot send, move or delete mail even if it wants to.
+on demand; nothing is written to this repo and nothing is echoed to stdout.
+
+Reading and sending are separate capabilities and stay separate. Everything except
+`send` is read-only by OAuth scope, so a token minted for reading cannot move or
+delete mail even if the caller asks it to; `send` additionally needs
+ZohoMail.messages.CREATE in the grant, and a token without it fails loudly rather
+than quietly doing nothing (see README.md step 3). `zmail whoami` reports which of
+the two you are currently holding.
 
 Commands
   zmail accounts                     account ids and addresses
@@ -12,7 +17,8 @@ Commands
   zmail list [-n N] [-f FOLDER]      newest N message summaries (default 25)
   zmail read <messageId> [-F fid]    one message, headers plus plain-text body
   zmail search <query> [-n N]        Zoho search syntax, newest first
-  zmail whoami                       token state, no secrets
+  zmail send -t TO -s SUBJ ...       compose a message; DRY RUN unless --send
+  zmail whoami                       token state and scope, no secrets
 
 Every command prints JSON on stdout. Errors go to stderr with a non-zero exit, so a
 caller can branch on the exit code without parsing prose.
@@ -44,50 +50,70 @@ def die(msg: str, code: int = 1):
     raise SystemExit(code)
 
 
-ENV_VARS = {
-    "client_id": "ZOHO_CLIENT_ID",
-    "client_secret": "ZOHO_CLIENT_SECRET",
-    "refresh_token": "ZOHO_REFRESH_TOKEN",
+# The mailbox credentials and the notification bridge's credentials are deliberately
+# NOT in the same keychain service: one is "read my mail", the other is "post into my
+# chat", and revoking one should not require finding the other. Same retrieval
+# mechanism, separate drawers.
+BRIDGE_SERVICE = "mail-telegram-bridge"
+
+# account -> (keychain service, environment override, what to do when it is missing).
+# The remedy travels with the secret because the error is where you read it.
+SECRETS = {
+    "client_id":         (KEYCHAIN_SERVICE, "ZOHO_CLIENT_ID",     "Run ./bootstrap.sh"),
+    "client_secret":     (KEYCHAIN_SERVICE, "ZOHO_CLIENT_SECRET", "Run ./bootstrap.sh"),
+    "refresh_token":     (KEYCHAIN_SERVICE, "ZOHO_REFRESH_TOKEN", "Run ./bootstrap.sh"),
+    "telegram_bot_token": (BRIDGE_SERVICE, "TELEGRAM_BOT_TOKEN", "Run ./bridge-setup.sh"),
+    "telegram_chat_id":   (BRIDGE_SERVICE, "TELEGRAM_CHAT_ID",   "Run ./bridge-setup.sh"),
 }
 
 
-def keychain(account: str) -> str:
+def keychain(account: str, required: bool = True) -> str | None:
     """Fetch one secret. Never logged, never returned in any command's output.
 
     Three sources, in order: the environment (for containers and CI, where no
     keyring daemon exists), the macOS Keychain, then libsecret on Linux. The
     environment comes first so a deployment can override without clearing a
     keyring it may not even have.
+
+    required=False returns None for a secret that is simply not configured, which
+    is how an optional feature asks "am I set up?" without dying on the answer.
     """
-    env = os.environ.get(ENV_VARS[account])
+    service, env_var, hint = SECRETS[account]
+    env = os.environ.get(env_var)
     if env:
         return env.strip()
 
     if sys.platform == "darwin":
-        cmd = ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"]
+        cmd = ["security", "find-generic-password", "-s", service, "-a", account, "-w"]
         store = "macOS Keychain"
     else:
-        cmd = ["secret-tool", "lookup", "service", KEYCHAIN_SERVICE, "account", account]
+        cmd = ["secret-tool", "lookup", "service", service, "account", account]
         store = "libsecret (secret-tool)"
 
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, check=True)
     except FileNotFoundError:
+        if not required:
+            return None
         die(
             f"{store} is not available on this machine.\n"
             f"Either install it, or supply the credential in the environment:\n"
-            f"  export {ENV_VARS[account]}=..."
+            f"  export {env_var}=..."
         )
     except subprocess.CalledProcessError:
+        if not required:
+            return None
         die(
-            f"no stored credential for {account!r} (service={KEYCHAIN_SERVICE}, {store}).\n"
+            f"no stored credential for {account!r} (service={service}, {store}).\n"
             # realpath, not abspath: this script is reached through a symlink on PATH,
             # and abspath would point the reader at a README that is not there.
-            f"Run ./bootstrap.sh -- see "
+            f"{hint} -- see "
             f"{os.path.join(os.path.dirname(os.path.realpath(__file__)), 'README.md')}"
         )
     if not out.stdout.strip():
-        die(f"stored credential for {account!r} is empty; re-run ./bootstrap.sh")
+        if not required:
+            return None
+        die(f"stored credential for {account!r} is empty; {hint.lower()}")
     return out.stdout.strip()
 
 
@@ -130,8 +156,21 @@ def access_token() -> str:
         json.dump({
             "access_token": tok["access_token"],
             "expires_at": time.time() + int(tok.get("expires_in", 3600)),
+            # The grant's scope, as Zoho reports it on every refresh. Cached so
+            # `whoami` can answer "may I send?" without spending a refresh call:
+            # the alternative is finding out from a 403 halfway through a send.
+            "scope": tok.get("scope", ""),
         }, f)
     return tok["access_token"]
+
+
+def cached_scope() -> str:
+    """Scope string from the last refresh, or '' if nothing has been cached yet."""
+    try:
+        with open(CACHE_PATH) as f:
+            return json.load(f).get("scope", "") or ""
+    except (OSError, ValueError):
+        return ""
 
 
 def api(path: str, params: dict | None = None) -> dict:
@@ -149,10 +188,45 @@ def api(path: str, params: dict | None = None) -> dict:
         detail = e.read().decode()[:600]
         if e.code in (401, 403):
             detail += (
-                "\n\nA 401/403 here is usually the SCOPE, not the token: this client is "
-                "minted read-only, so any write path is refused by design. If reads also "
-                "fail, the refresh token was issued for a narrower scope than the command "
-                "needs — re-mint it (README.md step 2)."
+                "\n\nA 401/403 here is usually the SCOPE, not the token: if reads fail, the "
+                "refresh token was issued for a narrower scope than the command needs — "
+                "re-mint it (README.md step 3)."
+            )
+        die(f"API HTTP {e.code} on {path}: {detail}")
+
+
+# The send scope is NOT part of the read-only set this repo started with, and a
+# token minted before sending existed will not grow one: `grant_type=refresh_token`
+# returns whatever the grant was authorised for and nothing more. Verified on
+# 2026-09-20 against this mailbox — the token endpoint answered
+# `ZohoMail.accounts.READ ZohoMail.folders.READ ZohoMail.messages.READ`, so every
+# send below would have come back 403 with no hint as to why.
+#
+# That is worth a named error rather than a raw HTTP dump: "403" on a correct
+# token and a correct body sends the reader looking for a bug in the payload.
+SEND_SCOPE = "ZohoMail.messages.CREATE"
+
+
+def api_post(path: str, payload: dict) -> dict:
+    url = f"{API_HOST}/api{path}"
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST", headers={
+        "Authorization": f"Zoho-oauthtoken {access_token()}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:600]
+        if e.code in (401, 403):
+            die(
+                f"API HTTP {e.code} on {path}: {detail}\n\n"
+                f"This is almost certainly the SCOPE, not the token or the body. Sending "
+                f"needs {SEND_SCOPE}, which the original read-only grant does not include. "
+                f"Check what you actually hold with `zmail whoami` and re-mint if the scope "
+                f"list has no {SEND_SCOPE} in it — README.md step 3. A refresh never widens "
+                f"a grant, so re-minting is the only route."
             )
         die(f"API HTTP {e.code} on {path}: {detail}")
 
@@ -267,6 +341,96 @@ def normalise_search(q: str) -> str:
     return f"{field}:{rest}"
 
 
+def read_body(inline: str | None, path: str | None) -> str:
+    """Body from --body or --body-file (`-` is stdin).
+
+    A file is the normal route for anything longer than a sentence: a real letter
+    carries newlines, quotes and em-dashes, and passing that through a shell
+    argument is where bodies get silently mangled.
+    """
+    if inline is not None and path is not None:
+        die("pass --body or --body-file, not both")
+    if inline is not None:
+        return inline
+    if path is None:
+        die("no body: pass --body TEXT or --body-file PATH (use - for stdin)")
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError as e:
+        die(f"cannot read body file {path!r}: {e}")
+
+
+def send_mail(aid: str, *, to: str, subject: str, content: str, mail_format: str,
+              cc: str | None, bcc: str | None, from_address: str | None,
+              reply_to: str | None, really_send: bool) -> dict:
+    """Compose and (only with really_send) transmit one message.
+
+    The dry run is the DEFAULT on purpose. Every other verb in this file is
+    read-only and therefore free to get wrong twice; this one puts a letter in
+    somebody else's inbox and there is no second attempt. So the safe thing has
+    to be what happens when a caller forgets the flag, not what happens when
+    they remember it.
+    """
+    if not from_address:
+        data = api("/accounts").get("data") or []
+        from_address = (data[0].get("primaryEmailAddress") if data else None)
+        if not from_address:
+            die("could not determine the From address; pass --from")
+
+    payload = {
+        "fromAddress": from_address,
+        "toAddress": to,
+        "subject": subject,
+        "content": content,
+        "mailFormat": mail_format,
+        "askReceipt": "no",
+    }
+    if cc:
+        payload["ccAddress"] = cc
+    if bcc:
+        payload["bccAddress"] = bcc
+
+    # What a caller can check BEFORE anything leaves: the addresses as the API
+    # will see them, and the size of the body rather than the body itself.
+    preview = {
+        "from": from_address,
+        "to": to,
+        "cc": cc,
+        "bcc": bcc,
+        "subject": subject,
+        "mailFormat": mail_format,
+        "body_chars": len(content),
+        "replyToMessageId": reply_to,
+    }
+
+    if not really_send:
+        return {"sent": False, "dryRun": True, "wouldSend": preview,
+                "note": "nothing was transmitted; re-run with --send to actually send"}
+
+    if reply_to:
+        payload["action"] = "reply"
+        resp = api_post(f"/accounts/{aid}/messages/{reply_to}", payload)
+    else:
+        resp = api_post(f"/accounts/{aid}/messages", payload)
+
+    # Zoho answers with a status block plus the stored message. Surface the ids a
+    # caller needs to verify the send independently, and keep the raw status so a
+    # partial success is not rounded up to "sent".
+    d = resp.get("data") or {}
+    return {
+        "sent": True,
+        "messageId": d.get("messageId"),
+        "folderId": d.get("folderId"),
+        "subject": preview["subject"],
+        "to": preview["to"],
+        "status": (resp.get("status") or {}).get("description"),
+        "note": "verify independently: the message should now be in Sent (`zmail list -f <sentFolderId>`)",
+    }
+
+
 def out(obj):
     json.dump(obj, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
@@ -297,9 +461,29 @@ def main():
     p.add_argument("query")
     p.add_argument("-n", "--limit", type=int, default=25)
 
+    p = sub.add_parser("send", help="send a message (dry run unless --send is passed)")
+    p.add_argument("-t", "--to", required=True, help="comma-separated recipients")
+    p.add_argument("-s", "--subject", required=True)
+    p.add_argument("--body", help="body text; prefer --body-file for anything real")
+    p.add_argument("--body-file", help="read the body from a file, or - for stdin")
+    p.add_argument("--cc")
+    p.add_argument("--bcc")
+    p.add_argument("--from", dest="from_address",
+                   help="sender; defaults to the account's primary address")
+    p.add_argument("--html", action="store_true", help="send as HTML instead of plain text")
+    p.add_argument("--reply-to", metavar="MESSAGE_ID",
+                   help="thread the message as a reply to this messageId")
+    p.add_argument("--send", action="store_true",
+                   help="actually transmit; without it the payload is only printed")
+
     a = ap.parse_args()
 
     if a.cmd == "whoami":
+        # Call FIRST, report second. On a cold cache this call is what mints the
+        # token and writes the scope, so reading the cache before it reported
+        # `cached: false` and an unknown scope for a perfectly healthy account --
+        # a diagnostic command lying about the thing it exists to diagnose.
+        accounts = api("/accounts").get("data") or []
         try:
             with open(CACHE_PATH) as f:
                 c = json.load(f)
@@ -307,10 +491,14 @@ def main():
             cache = {"cached": True, "expires_in_sec": max(0, left)}
         except (OSError, ValueError):
             cache = {"cached": False}
+        scope = cached_scope()
         out({"region": REGION, "api": API_HOST, "keychain_service": KEYCHAIN_SERVICE,
-             "token": cache, "accounts": [
+             "token": cache,
+             "scope": scope or "(unknown until the next token refresh)",
+             "can_send": (SEND_SCOPE in scope) if scope else None,
+             "accounts": [
                  {"accountId": d.get("accountId"), "address": d.get("primaryEmailAddress")}
-                 for d in (api("/accounts").get("data") or [])]})
+                 for d in accounts]})
         return
 
     if a.cmd == "accounts":
@@ -332,6 +520,18 @@ def main():
         data = api(f"/accounts/{aid}/messages/view",
                    {"limit": a.limit, "start": 1, "folderId": a.folder}).get("data") or []
         out([summary(m) for m in data])
+        return
+
+    if a.cmd == "send":
+        out(send_mail(
+            aid,
+            to=a.to,
+            subject=a.subject,
+            content=read_body(a.body, a.body_file),
+            mail_format="html" if a.html else "plaintext",
+            cc=a.cc, bcc=a.bcc, from_address=a.from_address,
+            reply_to=a.reply_to, really_send=a.send,
+        ))
         return
 
     if a.cmd == "search":
