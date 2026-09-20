@@ -10,12 +10,18 @@ SERVICE="zoho-mail-agent"
 REGION="${ZOHO_REGION:-com}"
 ACCOUNTS="https://accounts.zoho.${REGION}"
 
-echo "Zoho Mail — read-only agent credentials"
+echo "Zoho Mail — agent credentials"
 echo "Region: ${REGION}  (override with ZOHO_REGION=eu ./bootstrap.sh)"
 echo
 echo "Have api-console.zoho.com open with a Self Client created, and the"
 echo "generated code in hand. The code expires — 10 minutes at the shortest"
 echo "setting — so generate it immediately before running this."
+echo
+echo "The scope you pasted in the console is what this token can ever do."
+echo "A refresh never widens a grant, so to add sending later you come back"
+echo "here and redo it. For read plus send, the code must have been generated"
+echo "with ZohoMail.messages.CREATE alongside the three READ scopes."
+echo "Afterwards, 'zmail whoami' reports which one you ended up with."
 echo
 
 read -r  -p "Client ID:     " CLIENT_ID
