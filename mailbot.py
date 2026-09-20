@@ -141,51 +141,111 @@ def render(m: dict) -> str:
     return out[:TELEGRAM_LIMIT] if len(out) > TELEGRAM_LIMIT else out
 
 
-def notify(m: dict):
+def recipients() -> list[str]:
+    """The chat ids to deliver to, in configured order.
+
+    One mailbox can feed several agents, so the stored value is a list: ids
+    separated by commas or whitespace. A single id -- what bridge-setup.sh has
+    always written -- parses to a list of one, so existing installs are
+    unaffected.
+    """
+    raw = zmail.keychain("telegram_chat_id") or ""
+    ids = [c.strip() for c in raw.replace(",", " ").split()]
+    ids = [c for c in ids if c]
+    if not ids:
+        zmail.die("no telegram_chat_id configured; run ./bridge-setup.sh")
+    # Deduplicate while keeping order: the same chat listed twice would receive
+    # every mail twice, and the second copy looks like a bridge malfunction.
+    return list(dict.fromkeys(ids))
+
+
+def notify(chat_id: str, text: str):
     telegram("sendMessage", {
-        "chat_id": zmail.keychain("telegram_chat_id"),
-        "text": render(m),
+        "chat_id": chat_id,
+        "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     })
 
 
+def migrate_seen(state: dict, chats: list[str]) -> dict:
+    """Return the per-recipient seen map, upgrading the old single-chat format.
+
+    Deliveries are tracked per chat rather than per message. With one recipient
+    the two are the same thing; with several they are not, and a shared set
+    makes a partial failure unrecoverable -- retrying the message would deliver
+    a second copy to every chat that already had it.
+    """
+    seen = state.get("seen")
+    if isinstance(seen, list):
+        # The old format recorded one flat set for the single configured chat.
+        # Every currently configured chat inherits it as its horizon, which is
+        # right for the original recipient and safe for any added alongside it.
+        return {c: list(seen) for c in chats}
+    return dict(seen or {})
+
+
 def sweep(aid: str, folder: str, state: dict, limit: int = 25) -> int:
-    """One poll. Returns how many notifications went out."""
+    """One poll. Returns how many notifications went out, across all recipients."""
     data = zmail.api(f"/accounts/{aid}/messages/view",
                      {"limit": limit, "start": 1, "folderId": folder}).get("data") or []
     msgs = [zmail.summary(m) | {"folderId": folder} for m in data]
+    ids_now = [str(m["messageId"]) for m in msgs]
 
-    seen = set(state.get("seen") or [])
+    chats = recipients()
+    seen = migrate_seen(state, chats)
 
-    if not state.get("initialised"):
-        # First run: record the horizon, announce nothing. See the module docstring.
-        state["initialised"] = True
-        state["seen"] = [str(m["messageId"]) for m in msgs]
-        save_state(state)
-        log(f"first run: {len(msgs)} existing messages marked as seen, watching from here")
-        return 0
+    # A recipient with no horizon has never been watched -- either this is the
+    # first run, or a chat was added to an already-running bridge. Both get the
+    # same treatment: record where the mailbox is, announce nothing. Flooding a
+    # newly connected agent with the existing inbox is how a bridge gets muted.
+    fresh_chats = [c for c in chats if c not in seen]
+    for c in fresh_chats:
+        seen[c] = list(ids_now)
+        log(f"chat {c}: {len(ids_now)} existing messages marked as seen, watching from here")
 
-    # Oldest first, so a burst arrives in the chat in the order it arrived in the
-    # mailbox rather than reversed.
-    fresh = [m for m in reversed(msgs) if str(m["messageId"]) not in seen]
+    state["initialised"] = True
+
+    # render() fetches the message body, so it is memoised for the sweep: two
+    # recipients are two deliveries of one notification, not two fetches of the
+    # same mail.
+    rendered: dict[str, str] = {}
+
+    def text_for(m: dict) -> str:
+        key = str(m["messageId"])
+        if key not in rendered:
+            rendered[key] = render(m)
+        return rendered[key]
 
     sent = 0
-    for m in fresh:
-        try:
-            notify(m)
-        except RuntimeError as e:
-            # Network blip: leave it unseen so the next sweep retries it. Marking it
-            # seen here would silently drop the one mail the user needed.
-            log(f"deferred {m['messageId']}: {e}")
+    for chat in chats:
+        if chat in fresh_chats:
             continue
-        seen.add(str(m["messageId"]))
-        sent += 1
-        log(f"notified: {m.get('subject')!r} from {m.get('from')}")
+        known = set(seen[chat])
+        # Oldest first, so a burst arrives in the chat in the order it arrived in
+        # the mailbox rather than reversed.
+        fresh = [m for m in reversed(msgs) if str(m["messageId"]) not in known]
+        for m in fresh:
+            try:
+                notify(chat, text_for(m))
+            except RuntimeError as e:
+                # Network blip: leave it unseen so the next sweep retries it for
+                # THIS chat only. Marking it seen here would silently drop the
+                # one mail the user needed.
+                log(f"deferred {m['messageId']} for chat {chat}: {e}")
+                continue
+            known.add(str(m["messageId"]))
+            sent += 1
+            log(f"notified chat {chat}: {m.get('subject')!r} from {m.get('from')}")
+        # Bounded: the set only needs to cover what a `view` call can return, and
+        # an unbounded list would grow until the state file is the slowest part
+        # of a sweep.
+        seen[chat] = list(known)[-500:]
 
-    # Bounded: the set only needs to cover what a `view` call can return, and an
-    # unbounded list would grow until the state file is the slowest part of a sweep.
-    state["seen"] = list(seen)[-500:]
+    # A chat removed from the configuration keeps no state: leaving it would
+    # silently resume mid-stream if it were ever re-added, skipping everything
+    # that arrived while it was disconnected.
+    state["seen"] = {c: seen[c] for c in chats}
     state["last_sweep"] = time.strftime("%Y-%m-%d %H:%M:%S")
     save_state(state)
     return sent
@@ -206,15 +266,25 @@ def main():
 
     if a.status:
         state = load_state()
-        # Presence, never value. Knowing a token is configured is the diagnostic;
-        # knowing the token is a leak.
+        raw = zmail.keychain("telegram_chat_id", required=False) or ""
+        chats = [c for c in (x.strip() for x in raw.replace(",", " ").split()) if c]
+        seen = state.get("seen")
+        # A chat id is not a secret -- it is the address of a conversation this
+        # machine already delivers to -- and with several recipients the whole
+        # point of --status is telling which of them are actually wired up.
+        per_chat = (
+            {c: len(seen.get(c) or []) for c in chats} if isinstance(seen, dict)
+            else {c: len(seen or []) for c in chats}
+        )
         json.dump({
             "bot_token_configured": zmail.keychain("telegram_bot_token", required=False) is not None,
-            "chat_id_configured": zmail.keychain("telegram_chat_id", required=False) is not None,
+            "recipients": chats,
+            "recipient_count": len(chats),
             "keychain_service": zmail.BRIDGE_SERVICE,
             "state_path": STATE_PATH,
             "initialised": bool(state.get("initialised")),
-            "seen_count": len(state.get("seen") or []),
+            "seen_count_per_chat": per_chat,
+            "state_format": "per-chat" if isinstance(seen, dict) else "legacy-single-chat",
             "last_sweep": state.get("last_sweep"),
             "poll_interval_sec": a.interval,
         }, sys.stdout, ensure_ascii=False, indent=2)
@@ -230,12 +300,27 @@ def main():
         return
 
     if a.test:
-        telegram("sendMessage", {
-            "chat_id": zmail.keychain("telegram_chat_id"),
-            "text": "✅ <b>Мост почты подключён.</b>\nНовые письма на admin@t27.ai будут приходить сюда.",
-            "parse_mode": "HTML",
-        })
-        log("probe sent")
+        # Probe every recipient, and do not stop at the first failure: with
+        # several chats configured, "the probe failed" is useless unless it says
+        # which chat failed. A chat that has not started the bot yet is the
+        # normal cause, and it is per-chat.
+        ok, bad = [], []
+        for chat in recipients():
+            try:
+                telegram("sendMessage", {
+                    "chat_id": chat,
+                    "text": "✅ <b>Мост почты подключён.</b>\nНовые письма на admin@t27.ai будут приходить сюда.",
+                    "parse_mode": "HTML",
+                })
+                ok.append(chat)
+            except (RuntimeError, SystemExit) as e:
+                bad.append((chat, str(e).strip().splitlines()[0] if str(e).strip() else "failed"))
+        for chat in ok:
+            log(f"probe delivered to chat {chat}")
+        for chat, why in bad:
+            log(f"probe FAILED for chat {chat}: {why}")
+        if bad:
+            sys.exit(1)
         return
 
     aid = zmail.account_id()

@@ -11,6 +11,65 @@ set -euo pipefail
 
 SERVICE="mail-telegram-bridge"
 
+read_secret() {  # $1=account -- prints the stored value, empty if absent
+  case "$(uname -s)" in
+    Darwin) security find-generic-password -s "${SERVICE}" -a "$1" -w 2>/dev/null || true ;;
+    *)      secret-tool lookup service "${SERVICE}" account "$1" 2>/dev/null || true ;;
+  esac
+}
+
+store_secret() {  # $1=account $2=value -- never echoed
+  case "$(uname -s)" in
+    Darwin) security add-generic-password -U -s "${SERVICE}" -a "$1" -w "$2" ;;
+    *)      command -v secret-tool >/dev/null 2>&1 || {
+              echo "secret-tool not found. Install libsecret-tools (Debian/Ubuntu:" >&2
+              echo "  sudo apt install libsecret-tools) or export TELEGRAM_BOT_TOKEN" >&2
+              echo "  and TELEGRAM_CHAT_ID instead." >&2
+              exit 1; }
+            printf '%s' "$2" | secret-tool store --label="${SERVICE} $1" \
+              service "${SERVICE}" account "$1" ;;
+  esac
+}
+
+# One mailbox can feed several agents. Adding one afterwards must not require
+# re-entering the bot token, so it is its own mode.
+#
+#   ./bridge-setup.sh --add-chat 229866794
+#   ./bridge-setup.sh --list-chats
+#   ./bridge-setup.sh --remove-chat 229866794
+if [ "${1:-}" = "--add-chat" ] || [ "${1:-}" = "--remove-chat" ]; then
+  TARGET="${2:-}"
+  [ -n "${TARGET}" ] || { echo "Usage: $0 $1 <chat-id>" >&2; exit 1; }
+  case "${TARGET}" in
+    ''|*[!0-9-]*) echo "A chat id is digits, optionally leading '-' for a group." >&2; exit 1 ;;
+  esac
+  CURRENT="$(read_secret telegram_chat_id)"
+  NEW=""
+  for c in ${CURRENT//,/ }; do
+    [ "$c" = "${TARGET}" ] && continue          # drop it; re-added below if adding
+    NEW="${NEW:+${NEW},}$c"
+  done
+  if [ "${1}" = "--add-chat" ]; then
+    NEW="${NEW:+${NEW},}${TARGET}"
+  fi
+  [ -n "${NEW}" ] || { echo "That would leave no recipients. Refusing." >&2; exit 1; }
+  store_secret telegram_chat_id "${NEW}"
+  echo "Recipients are now: ${NEW}"
+  echo
+  if [ "${1}" = "--add-chat" ]; then
+    echo "A bot cannot open a conversation on its own. Chat ${TARGET} must send"
+    echo "the bot a message first, or delivery fails with 'chat not found'."
+    echo "Check with: ./mailbot.py --test"
+  fi
+  exit 0
+fi
+
+if [ "${1:-}" = "--list-chats" ]; then
+  CURRENT="$(read_secret telegram_chat_id)"
+  [ -n "${CURRENT}" ] && echo "${CURRENT}" || echo "(no recipients configured)"
+  exit 0
+fi
+
 echo "Telegram bridge for agent-mail"
 echo
 echo "1. Open Telegram and talk to @BotFather"
@@ -44,13 +103,22 @@ echo "Now open a chat with @${BOT_NAME} in Telegram and send it any message"
 echo "(just 'hi' is enough). A bot cannot start a conversation with you --"
 echo "Telegram only lets it reply, so this step is not optional."
 echo
-read -r -p "Press Enter once you have sent it..."
+echo "Feeding several agents? Have EACH of them message the bot now. Every chat"
+echo "that has written to it will be picked up in one pass."
+echo
+read -r -p "Press Enter once they have sent it..."
 
-echo "Looking for your chat..."
+echo "Looking for chats..."
 CHAT_ID=""
 for _ in 1 2 3 4 5; do
   UPDATES="$(curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates" || true)"
-  CHAT_ID="$(printf '%s' "${UPDATES}" | sed -n 's/.*"chat":{"id":\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' | head -1)"
+  # Every distinct chat, not just the first: one mailbox can feed several agents,
+  # and picking head -1 silently ignored everyone who wrote in second.
+  CHAT_ID="$(printf '%s' "${UPDATES}" \
+    | grep -o '"chat":{"id":-\{0,1\}[0-9]\{1,\}' \
+    | sed 's/.*://' \
+    | awk '!seen[$0]++' \
+    | paste -sd, -)"
   [ -n "${CHAT_ID}" ] && break
   sleep 2
 done
@@ -63,21 +131,8 @@ if [ -z "${CHAT_ID}" ]; then
   echo "second copy of this script)." >&2
   exit 1
 fi
-echo "Found chat id: ${CHAT_ID}"
+echo "Found chat id(s): ${CHAT_ID}"
 echo
-
-store_secret() {  # $1=account $2=value -- never echoed
-  case "$(uname -s)" in
-    Darwin) security add-generic-password -U -s "${SERVICE}" -a "$1" -w "$2" ;;
-    *)      command -v secret-tool >/dev/null 2>&1 || {
-              echo "secret-tool not found. Install libsecret-tools (Debian/Ubuntu:" >&2
-              echo "  sudo apt install libsecret-tools) or export TELEGRAM_BOT_TOKEN" >&2
-              echo "  and TELEGRAM_CHAT_ID instead." >&2
-              exit 1; }
-            printf '%s' "$2" | secret-tool store --label="${SERVICE} $1" \
-              service "${SERVICE}" account "$1" ;;
-  esac
-}
 
 store_secret telegram_bot_token "${BOT_TOKEN}"
 store_secret telegram_chat_id "${CHAT_ID}"
@@ -88,6 +143,9 @@ echo
 echo "Test it:        ./mailbot.py --test"
 echo "One sweep:      ./mailbot.py --once"
 echo "Keep watching:  ./mailbot.py --watch"
+echo
+echo "Add a recipient later:  $0 --add-chat <id>"
+echo "List them:              $0 --list-chats"
 echo
 echo "The first sweep announces nothing: it records where the mailbox is now and"
 echo "notifies only about what arrives after."

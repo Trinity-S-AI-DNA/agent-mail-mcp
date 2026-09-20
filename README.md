@@ -199,10 +199,36 @@ The MCP tools are *pull*: an agent sees mail when it looks. `mailbot.py` is the
 *push* half, so a letter reaches you without anyone asking.
 
 ```bash
-./bridge-setup.sh        # BotFather token in, chat id discovered for you
-./mailbot.py --test      # one probe message
+./bridge-setup.sh        # BotFather token in, chat ids discovered for you
+./mailbot.py --test      # one probe per recipient
 ./mailbot.py --watch     # poll the Inbox until stopped
 ```
+
+**One mailbox can feed several agents.** Every chat that has messaged the bot when
+you run the setup is picked up; afterwards, add and remove recipients without
+re-entering the token:
+
+```bash
+./bridge-setup.sh --add-chat 123456789
+./bridge-setup.sh --list-chats
+./bridge-setup.sh --remove-chat 123456789
+```
+
+Delivery is tracked **per recipient**, not per message. With one chat the two are
+the same thing; with several they are not, and a shared record makes a partial
+failure unrecoverable — retrying the message would put a second copy in every chat
+that already had it. So a chat that is unreachable falls behind alone and catches up
+on the next sweep, and a chat added to a running bridge is baselined on first sight
+rather than flooded with the existing inbox.
+
+**A bot cannot open a conversation.** Telegram only lets it reply, so each recipient
+must send the bot a message before it can receive anything. Adding a chat id that has
+never written to the bot stores fine and then fails delivery with *chat not found*;
+`--test` reports which recipient failed rather than stopping at the first.
+
+**Every recipient sees the whole Inbox.** There is no per-recipient filter. Adding a
+chat grants it a live feed of everything that arrives, including whatever a stranger
+chooses to send you — so a recipient is a disclosure decision, not a settings change.
 
 **Polling, not IMAP IDLE — and not by preference.** Zoho disables IMAP/POP for
 Free-plan accounts created after 2024, so on such a mailbox IDLE is unavailable at
