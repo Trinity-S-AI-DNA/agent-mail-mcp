@@ -42,14 +42,21 @@ TOOLS = [
     {
         "name": "mail_search",
         "description": (
-            "Search the mailbox using Zoho search syntax, e.g. 'from:arxiv.org', "
-            "'subject:invoice', 'newer_than:7d'. Returns the same summary shape as "
-            "mail_list. Prefer this over listing everything and filtering yourself."
+            "Search the mailbox. Only two fields work: write a bare word ('arxiv.org') "
+            "or 'entire:<term>' / 'content:<term>'. 'from:', 'subject:', 'sender:' and "
+            "'newer_than:' are REFUSED with a non-zero exit, because Zoho ignores an "
+            "unknown field and returns unfiltered mail with HTTP 200. Returns the same "
+            "summary shape as mail_list.\n"
+            "A HIT is evidence; an EMPTY RESULT IS NOT. The search index lags the "
+            "mailbox by days, so recent mail is unfindable by its own words. To prove "
+            "you have NOT written to someone -- before sending anything -- enumerate "
+            "the Sent folder with mail_list and match yourself. Do not settle a dedup "
+            "question with this tool."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Zoho search expression."},
+                "query": {"type": "string", "description": "Bare term, or entire:<term> / content:<term>."},
                 "limit": {"type": "integer", "description": "How many results (default 25).", "minimum": 1, "maximum": 200},
             },
             "required": ["query"],

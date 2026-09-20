@@ -178,11 +178,22 @@ def strip_html(s: str) -> str:
 
 def summary(m: dict) -> dict:
     """Keep the fields an agent triages on. Full bodies are one `read` away."""
-    ts = m.get("receivedTime") or m.get("sentDateInGMT")
+    # The two fields are NOT the same clock, and the fallback used to hide that.
+    # Measured on one message on 2026-08-28: receivedTime is a true epoch and
+    # renders as 21:11 local, the wall-clock moment Send was pressed;
+    # sentDateInGMT is that same wall clock stored as though it were a UTC
+    # epoch, so localtime() on it yields 04:11 THE NEXT DAY. Seven hours and a
+    # date boundary, silently, only for messages missing receivedTime. Despite
+    # the name, sentDateInGMT is the one that needs gmtime().
+    ts, gmt = m.get("receivedTime"), False
+    if not ts:
+        ts, gmt = m.get("sentDateInGMT"), True
     when = None
     if ts:
         try:
-            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts) / 1000))
+            secs = int(ts) / 1000
+            when = time.strftime("%Y-%m-%d %H:%M",
+                                 time.gmtime(secs) if gmt else time.localtime(secs))
         except (ValueError, TypeError):
             when = str(ts)
     return {
@@ -211,6 +222,19 @@ def summary(m: dict) -> dict:
 # and is wrong with no error anywhere. Refusing the query is the only safe answer.
 SEARCH_FIELDS = ("entire", "content")
 
+# CORRECTION 2026-08-29. The `contains:` operator is dead on this mailbox, and it
+# was the form this file generated for every bare word, so `zmail search <word>`
+# could not match anything -- ever.
+#
+#   entire:contains:ternellism  -> 0     entire:ternellism  -> 1  (mail sent 09:36 that day)
+#   entire:contains:baez        -> 0     entire:baez        -> 3  (March, long indexed)
+#   entire:contains:calligo     -> 0     entire:zzzqqqnope  -> 0  (so `entire:` really filters)
+#
+# The empty answer is the dangerous part: a dedup check reads it as "we have never
+# written to them" and the next thing that happens is a duplicate application. The
+# two-term form is therefore rewritten rather than passed through.
+SEARCH_OPERATORS = ("contains",)
+
 
 def normalise_search(q: str) -> str:
     """Turn a user query into a searchKey Zoho actually honours.
@@ -218,21 +242,29 @@ def normalise_search(q: str) -> str:
     A bare word gets wrapped rather than rejected: Zoho answers an unwrapped term
     with "Invalid search query", which is a confusing failure for the most obvious
     thing to type.
+
+    `contains:` is stripped wherever it appears, because it silently matches
+    nothing -- see the measurement above.
     """
     q = q.strip()
     if ":" not in q:
-        return f"entire:contains:{q}"
-    field = q.split(":", 1)[0].strip()
+        return f"entire:{q}"
+    field, rest = q.split(":", 1)
+    field = field.strip()
     if field.lower() not in SEARCH_FIELDS:
         die(
             f"unsupported search field {field!r}.\n"
             f"Zoho does not reject an unknown field -- it IGNORES it and returns your "
             f"newest mail unfiltered, with HTTP 200, so the results would look like "
             f"matches and would not be.\n"
-            f"Use one of: {', '.join(SEARCH_FIELDS)} -- e.g. entire:contains:{q.split(':')[-1]}\n"
-            f"To match a sender, search the address as text: entire:contains:arxiv.org"
+            f"Use one of: {', '.join(SEARCH_FIELDS)} -- e.g. entire:{q.split(':')[-1]}\n"
+            f"To match a sender, search the address as text: entire:arxiv.org"
         )
-    return q
+    op, _, tail = rest.partition(":")
+    if tail and op.strip().lower() in SEARCH_OPERATORS:
+        # Measured dead on 2026-08-29: this form returns 0 for every term.
+        rest = tail
+    return f"{field}:{rest}"
 
 
 def out(obj):
