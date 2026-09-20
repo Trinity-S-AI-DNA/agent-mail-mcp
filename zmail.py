@@ -411,8 +411,27 @@ def send_mail(aid: str, *, to: str, subject: str, content: str, mail_format: str
     }
 
     if not really_send:
-        return {"sent": False, "dryRun": True, "wouldSend": preview,
-                "note": "nothing was transmitted; re-run with --send to actually send"}
+        # A dry run that looks clean for a send which cannot succeed is worse than
+        # no dry run at all: it is a preflight that passes an aircraft with no fuel,
+        # and the caller only learns better after composing the whole letter.
+        # Measured 2026-09-20: this returned `wouldSend` with no caveat, and the
+        # same call with --send came back 401 INVALID_OAUTHSCOPE. The scope is
+        # already on disk at that moment -- `whoami` reads it from the same place --
+        # so the one thing a preflight exists to catch was knowable here all along.
+        scope = cached_scope()
+        can_send = (SEND_SCOPE in scope) if scope else None
+        res = {"sent": False, "dryRun": True, "can_send": can_send, "wouldSend": preview,
+               "note": "nothing was transmitted; re-run with --send to actually send"}
+        if can_send is False:
+            res["blocked"] = (
+                f"--send WOULD FAIL: the grant has no {SEND_SCOPE}, so Zoho answers "
+                f"401 INVALID_OAUTHSCOPE. Held: {scope}. A refresh never widens a "
+                f"grant -- re-mint via README.md step 3.")
+        elif can_send is None:
+            res["blocked"] = (
+                "cannot tell whether --send would work: no scope is cached yet. "
+                "Run `zmail whoami` first, which mints a token and records it.")
+        return res
 
     if reply_to:
         payload["action"] = "reply"
