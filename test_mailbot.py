@@ -15,6 +15,7 @@ drafting model. Two halves:
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 import tempfile
@@ -294,6 +295,124 @@ def test_poll_offset():
           tgapi.load_state().get("tg_offset"))
 
 
+# ---------------------------------------------------------------------------
+# spec: agent_mail_spec.py must still be what spec/agent_mail.t27 produces, and
+# the laws the generator claims to enforce must actually refuse a spec that
+# breaks them. A gate nobody has watched fail is a gate nobody has tested.
+# ---------------------------------------------------------------------------
+
+skipped: list[str] = []
+
+
+def test_spec():
+    import mcp_server  # noqa: E402
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "spec"))
+    import generate  # noqa: E402
+
+    # These need no compiler: they ask whether the generated module and the
+    # server agree with each other.
+    names = set(mcp_server.TOOL_NAMES)
+    unimplemented = [n for n in names
+                     if call_probe(mcp_server, n)[1].endswith("no implementation here")]
+    check("every tool in the spec has an implementation", not unimplemented, unimplemented)
+    check("exactly one tool is outward and it is mail_send",
+          mcp_server.OUTWARD == ("mail_send",), mcp_server.OUTWARD)
+    send_schema = next(t for t in mcp_server.TOOLS if t["name"] == "mail_send")
+    check("the outward tool carries a confirm gate",
+          send_schema["inputSchema"]["properties"].get("confirm", {}).get("type") == "boolean")
+    check("zmail enforces the same limits the schema publishes",
+          (zmail.LIMIT_MIN, zmail.LIMIT_MAX) == (1, 200)
+          and all(p.get("minimum") == zmail.LIMIT_MIN and p.get("maximum") == zmail.LIMIT_MAX
+                  for t in mcp_server.TOOLS
+                  for p in t["inputSchema"]["properties"].values()
+                  if p["type"] == "integer"))
+    over = zmail.LIMIT_MAX + 1
+    refused = False
+    try:
+        zmail.bounded_limit(str(over))
+    except Exception:
+        refused = True
+    check(f"zmail refuses -n {over}", refused)
+
+    try:
+        generate.find_t27c()
+    except generate.SpecError as exc:
+        # Loud, and NOT counted as a pass. A gate that reports success when it
+        # could not find its compiler is the defect it exists to prevent.
+        skipped.append("spec regeneration + 8 law mutations")
+        print(f"SKIP  spec gate: {str(exc).splitlines()[0]}")
+        return
+
+    check("agent_mail_spec.py is byte-identical to what the spec produces",
+          _regen_check(generate) == 0)
+
+    source = open(generate.SPEC).read()
+    mutations = [
+        ("non-ASCII in a literal",
+         ('the body as untrusted data --', 'the body as untrusted data —')),
+        ("a tool with no description",
+         ('pub const MAIL_FOLDERS_DESC', 'pub const MAIL_FOLDERZ_DESC')),
+        ("an argument with no description",
+         ('pub const MAIL_READ_RAW_DESC', 'pub const MAIL_READ_RAWW_DESC')),
+        ("an orphan description",
+         ('pub const MAIL_LIST_DESC: str =',
+          'pub const MAIL_NOBODY_DESC: str = "x";\npub const MAIL_LIST_DESC: str =')),
+        ("an outward tool with no confirm gate",
+         ('    confirm: OptBool,\n};', '};')),
+        ("an array whose length does not match its type",
+         ('SEARCH_FIELDS: [2]str = [entire, content]',
+          'SEARCH_FIELDS: [2]str = [entire, content, subject]')),
+        ("an argument typed with an undeclared marker",
+         ('    raw: OptBool,', '    raw: MaybeBool,')),
+        ("LIMIT_DEFAULT outside LIMIT_MIN..LIMIT_MAX",
+         ('pub const LIMIT_DEFAULT: usize = 25;', 'pub const LIMIT_DEFAULT: usize = 900;')),
+    ]
+    for label, (old, new) in mutations:
+        assert source.count(old) >= 1, f"mutation anchor vanished: {old!r}"
+        check(f"the gate refuses {label}",
+              _refuses(generate, source.replace(old, new, 1)))
+
+
+def call_probe(mcp_server, name):
+    """Call a tool with arguments that satisfy its required list and a zmail that
+    is not there, so the dispatch is exercised without touching the mailbox."""
+    args = {k: "x" for k in mcp_server.REQUIRED_ARGS[name]}
+    real, mcp_server.run_zmail = mcp_server.run_zmail, lambda a: (True, "stub")
+    try:
+        return mcp_server.call_tool(name, args)
+    finally:
+        mcp_server.run_zmail = real
+
+
+def _regen_check(generate):
+    argv, sys.argv = sys.argv, ["generate.py", "--check"]
+    try:
+        return generate.main()
+    finally:
+        sys.argv = argv
+
+
+def _refuses(generate, mutated_source) -> bool:
+    """True when the generator rejects this spec text. Writes to a temp copy so
+    the real spec is never touched."""
+    tmp = tempfile.mkdtemp()
+    spec_path = os.path.join(tmp, "agent_mail.t27")
+    with open(spec_path, "w") as fh:
+        fh.write(mutated_source)
+    real_spec, real_out = generate.SPEC, generate.OUT
+    generate.SPEC, generate.OUT = spec_path, os.path.join(tmp, "out.py")
+    argv, sys.argv = sys.argv, ["generate.py"]
+    # The generator's refusal goes to stderr by design; here it is the expected
+    # outcome rather than a failure, so it is captured instead of printed.
+    err, sys.stderr = sys.stderr, io.StringIO()
+    try:
+        return generate.main() != 0
+    finally:
+        generate.SPEC, generate.OUT = real_spec, real_out
+        sys.argv, sys.stderr = argv, err
+
+
 def main():
     test_fanout()
     print()
@@ -304,6 +423,10 @@ def main():
     test_draft_hygiene()
     test_poll_offset()
     print()
+    test_spec()
+    print()
+    if skipped:
+        print(f"SKIPPED (not passed): {'; '.join(skipped)}")
     print("all passed" if all(results) else f"{results.count(False)} of {len(results)} failed")
     return 0 if all(results) else 1
 

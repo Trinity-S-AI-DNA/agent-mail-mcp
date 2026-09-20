@@ -35,6 +35,25 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# ~/.local/bin/zmail is a symlink to this file, so the directory Python derives
+# from the invocation is not necessarily the one the module lives in.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+# GENERATED from spec/agent_mail.t27 -- the limits and scopes below are the
+# spec's, not this file's. Change them there and re-run spec/generate.py.
+from agent_mail_spec import (  # noqa: E402
+    BODY_TRUNCATE_DEFAULT,
+    LIMIT_DEFAULT,
+    LIMIT_MAX,
+    LIMIT_MIN,
+    MESSAGE_LOOKUP_WINDOW,
+    SEARCH_FIELDS,
+    SEARCH_OPERATORS,
+    SEND_REFUSED_CODE,
+    SEND_REFUSED_STATUS,
+    SEND_SCOPE,
+)
+
 KEYCHAIN_SERVICE = "zoho-mail-agent"
 # Zoho is region-partitioned: a token minted in one DC is rejected by the others, and
 # the error for that ("invalid client") reads exactly like a wrong secret. Override
@@ -203,12 +222,18 @@ def api(path: str, params: dict | None = None) -> dict:
 # token minted before sending existed will not grow one: `grant_type=refresh_token`
 # returns whatever the grant was authorised for and nothing more. Verified on
 # 2026-09-20 against this mailbox — the token endpoint answered
-# `ZohoMail.accounts.READ ZohoMail.folders.READ ZohoMail.messages.READ`, so every
-# send below would have come back 403 with no hint as to why.
+# `ZohoMail.accounts.READ ZohoMail.folders.READ ZohoMail.messages.READ`.
 #
-# That is worth a named error rather than a raw HTTP dump: "403" on a correct
-# token and a correct body sends the reader looking for a bug in the payload.
-SEND_SCOPE = "ZohoMail.messages.CREATE"
+# What a send without it actually returns was guessed here for a month and then
+# measured on 2026-09-20 by sending one, self-addressed: `401 INVALID_OAUTHSCOPE`,
+# not the 403 this comment and the tool descriptions both predicted. Nothing was
+# transmitted. That is worth a named error rather than a raw HTTP dump: a bare
+# status code on a correct token and a correct body sends the reader looking for
+# a bug in the payload.
+#
+# SEND_SCOPE, SEND_REFUSED_STATUS and SEND_REFUSED_CODE are imported from the
+# generated spec above, so the number in the tool description and the number
+# here cannot drift apart again.
 
 
 def api_post(path: str, payload: dict) -> dict:
@@ -298,7 +323,7 @@ def summary(m: dict) -> dict:
 # it and returns the newest messages UNFILTERED, with HTTP 200. `from:contains:arxiv`
 # came back with mail from hh.ru. An agent reads that as "here are the arXiv mails"
 # and is wrong with no error anywhere. Refusing the query is the only safe answer.
-SEARCH_FIELDS = ("entire", "content")
+# SEARCH_FIELDS is imported from the generated spec.
 
 # CORRECTION 2026-08-29. The `contains:` operator is dead on this mailbox, and it
 # was the form this file generated for every bare word, so `zmail search <word>`
@@ -311,7 +336,7 @@ SEARCH_FIELDS = ("entire", "content")
 # The empty answer is the dangerous part: a dedup check reads it as "we have never
 # written to them" and the next thing that happens is a duplicate application. The
 # two-term form is therefore rewritten rather than passed through.
-SEARCH_OPERATORS = ("contains",)
+# SEARCH_OPERATORS is imported from the generated spec.
 
 
 def normalise_search(q: str) -> str:
@@ -425,8 +450,8 @@ def send_mail(aid: str, *, to: str, subject: str, content: str, mail_format: str
         if can_send is False:
             res["blocked"] = (
                 f"--send WOULD FAIL: the grant has no {SEND_SCOPE}, so Zoho answers "
-                f"401 INVALID_OAUTHSCOPE. Held: {scope}. A refresh never widens a "
-                f"grant -- re-mint via README.md step 3.")
+                f"{SEND_REFUSED_STATUS} {SEND_REFUSED_CODE}. Held: {scope}. A refresh "
+                f"never widens a grant -- re-mint via README.md step 3.")
         elif can_send is None:
             res["blocked"] = (
                 "cannot tell whether --send would work: no scope is cached yet. "
@@ -459,6 +484,24 @@ def out(obj):
     sys.stdout.write("\n")
 
 
+def bounded_limit(text: str) -> int:
+    """Hold -n to the bounds the spec publishes in the MCP schema.
+
+    The schema has always said minimum 1, maximum 200; the CLI accepted any int,
+    so `-n 0` returned an empty page that reads as an empty mailbox and `-n 5000`
+    asked Zoho for something it will not give. One of the two was lying, and the
+    schema is the one that agents read.
+    """
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if not LIMIT_MIN <= value <= LIMIT_MAX:
+        raise argparse.ArgumentTypeError(
+            f"limit must be between {LIMIT_MIN} and {LIMIT_MAX}, got {value}")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser(prog="zmail", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -469,7 +512,7 @@ def main():
     sub.add_parser("whoami")
 
     p = sub.add_parser("list")
-    p.add_argument("-n", "--limit", type=int, default=25)
+    p.add_argument("-n", "--limit", type=bounded_limit, default=LIMIT_DEFAULT)
     p.add_argument("-f", "--folder", help="folder id; default is every folder")
 
     p = sub.add_parser("read")
@@ -477,12 +520,12 @@ def main():
     p.add_argument("-F", "--folder", required=False, help="folder id (looked up if omitted)")
     p.add_argument("--raw", action="store_true", help="keep the HTML body as-is")
     p.add_argument("--full", action="store_true", help="do not truncate the body")
-    p.add_argument("--max-chars", type=int, default=20000,
-                   help="truncate the body at N chars (default 20000)")
+    p.add_argument("--max-chars", type=int, default=BODY_TRUNCATE_DEFAULT,
+                   help=f"truncate the body at N chars (default {BODY_TRUNCATE_DEFAULT})")
 
     p = sub.add_parser("search")
     p.add_argument("query")
-    p.add_argument("-n", "--limit", type=int, default=25)
+    p.add_argument("-n", "--limit", type=bounded_limit, default=LIMIT_DEFAULT)
 
     p = sub.add_parser("send", help="send a message (dry run unless --send is passed)")
     p.add_argument("-t", "--to", required=True, help="comma-separated recipients")
@@ -570,12 +613,13 @@ def main():
         # so the headers come from the summary view, which is also where the
         # folderId lookup happens. One scan serves both.
         folder, head = a.folder, None
-        for m in (api(f"/accounts/{aid}/messages/view", {"limit": 200, "start": 1}).get("data") or []):
+        for m in (api(f"/accounts/{aid}/messages/view", {"limit": MESSAGE_LOOKUP_WINDOW, "start": 1}).get("data") or []):
             if str(m.get("messageId")) == str(a.message_id):
                 head, folder = m, folder or m.get("folderId")
                 break
         if not folder:
-            die(f"message {a.message_id} not in the newest 200; pass -F <folderId>")
+            die(f"message {a.message_id} not in the newest {MESSAGE_LOOKUP_WINDOW}; "
+                f"pass -F <folderId>")
 
         raw = (api(f"/accounts/{aid}/folders/{folder}/messages/{a.message_id}/content")
                .get("data") or {}).get("content") or ""
@@ -606,7 +650,8 @@ def main():
             result["note"] = (f"body truncated to {a.max_chars} of {full} chars; "
                               f"re-run with --full or a larger --max-chars")
         if head is None:
-            result["note"] = "headers unavailable: message is outside the newest 200"
+            result["note"] = ("headers unavailable: message is outside the newest "
+                              f"{MESSAGE_LOOKUP_WINDOW}")
         out(result)
         return
 

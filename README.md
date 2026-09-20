@@ -39,6 +39,15 @@ nobody tests.
 returns an empty list — "no mail" and "not authenticated" must not look alike, because
 an agent that confuses them stops silently and reports success.
 
+**The surface is written once, in t27.** [`spec/agent_mail.t27`](spec/agent_mail.t27)
+holds the tool names, their prose, their argument schemas, and the limits and scopes
+the CLI enforces. `spec/generate.py` reads it through `t27c parse --json` and writes
+`agent_mail_spec.py`, which both front doors import. The tool table used to be a
+hundred and ten hand-written lines inside `mcp_server.py` restating in prose what
+`zmail.py` enforced in code — and it had drifted: it told agents a send without the
+scope "comes back 403", where the API answers **401 `INVALID_OAUTHSCOPE`**. Two homes
+for one fact is one home too many.
+
 ---
 
 # Setting up on a new computer
@@ -413,6 +422,35 @@ exit code instead of parsing prose.
 Only `mail_send` changes anything outside this machine, and only when called with
 `confirm=true`.
 
+### Changing a tool
+
+Edit [`spec/agent_mail.t27`](spec/agent_mail.t27), then:
+
+```bash
+python3 spec/generate.py && python3 test_mailbot.py
+```
+
+The generator refuses a spec that breaks one of its own laws, and each refusal is a
+test: a tool with no description, an argument with no description, a description with
+nothing to describe, an outward tool without a `confirm` gate, an argument typed with
+an undeclared marker, an array whose length disagrees with its type, `LIMIT_DEFAULT`
+outside its bounds, and **any non-ASCII inside a string literal** — the t27 lexer reads
+bytes as characters, so an em dash would arrive in an agent's tool list as three
+mangled code points. Write `--`; comments never reach the AST and may say anything.
+
+`t27c` is found at `$T27C`, then `~/t27/target/release/t27c`, then on `PATH`. Without
+it the gate reports **SKIP**, loudly and separately from the passes — a gate that
+cannot find its compiler and reports success is the defect it exists to prevent.
+
+> **What is not generated: the server itself.** `t27c` emits Zig and Verilog only;
+> any function body containing `if`, `match` or `switch` lowers to
+> `@compileError("not yet implemented")`; and its Zig backend drops the quotes from a
+> string literal, so `pub const NAME: str = "mail_list";` becomes non-compiling Zig.
+> An executable MCP server in t27 is not available to be written today. The spec is
+> the source of truth for the *surface and the laws*; the runtime stays Python, and
+> `t27c parse --json` — which is faithful where codegen is not — is what the generator
+> consumes.
+
 ---
 
 # Behaviour worth knowing before you trust the output
@@ -513,6 +551,9 @@ secret-tool clear service zoho-mail-agent account refresh_token
 
 | File | What it is |
 | --- | --- |
+| `spec/agent_mail.t27` | **the source**: tool surface, prose, schemas, limits, scopes |
+| `spec/generate.py` | reads the spec with `t27c parse --json`, writes `agent_mail_spec.py` |
+| `agent_mail_spec.py` | GENERATED — do not edit; imported by both front doors |
 | `zmail.py` | the CLI; all API logic lives here |
 | `mcp_server.py` | stdio MCP server, wrapping the CLI as seven tools |
 | `bootstrap.sh` | one-time mailbox credential setup; run it yourself |
