@@ -26,6 +26,7 @@ caller can branch on the exit code without parsing prose.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -150,22 +151,37 @@ def post_form(url: str, fields: dict) -> dict:
         die(f"token endpoint HTTP {e.code}: {e.read().decode()[:400]}")
 
 
+def grant_id(refresh_token: str) -> str:
+    """Which grant a cached access token came from. A digest, never the token.
+
+    Widening a grant mints a *new* refresh token, and the access token already in
+    the cache keeps the old, narrower scope for up to an hour. Without this the
+    widening looks like it did nothing: `whoami` goes on reporting can_send false,
+    a send goes on failing with INVALID_OAUTHSCOPE, and no error anywhere names
+    the cache. That cost an hour the first time the send scope was added, so the
+    cache is now bound to the grant that filled it and a swap discards it.
+    """
+    return hashlib.sha256(refresh_token.encode()).hexdigest()[:16]
+
+
 def access_token() -> str:
     """Return a live access token, refreshing only when the cached one is stale.
 
     Zoho access tokens last an hour but the refresh endpoint is rate limited, so a
     fresh token per invocation would throttle an agent doing a normal sweep.
     """
+    refresh = keychain("refresh_token")
+    grant = grant_id(refresh)
     try:
         with open(CACHE_PATH) as f:
             c = json.load(f)
-        if c.get("expires_at", 0) - 120 > time.time():
+        if c.get("expires_at", 0) - 120 > time.time() and c.get("grant") == grant:
             return c["access_token"]
     except (OSError, ValueError, KeyError):
         pass
 
     tok = post_form(f"{ACCOUNTS_HOST}/oauth/v2/token", {
-        "refresh_token": keychain("refresh_token"),
+        "refresh_token": refresh,
         "client_id": keychain("client_id"),
         "client_secret": keychain("client_secret"),
         "grant_type": "refresh_token",
@@ -183,15 +199,24 @@ def access_token() -> str:
             # `whoami` can answer "may I send?" without spending a refresh call:
             # the alternative is finding out from a 403 halfway through a send.
             "scope": tok.get("scope", ""),
+            "grant": grant,
         }, f)
     return tok["access_token"]
 
 
 def cached_scope() -> str:
-    """Scope string from the last refresh, or '' if nothing has been cached yet."""
+    """Scope string from the last refresh, or '' if nothing usable is cached.
+
+    A cache written by a different grant is not "nothing cached" -- it is worse,
+    because it answers the can-I-send question with last week's answer. Treat it
+    as absent: '' makes the dry run say it cannot tell, which is true.
+    """
     try:
         with open(CACHE_PATH) as f:
-            return json.load(f).get("scope", "") or ""
+            c = json.load(f)
+        if c.get("grant") != grant_id(keychain("refresh_token")):
+            return ""
+        return c.get("scope", "") or ""
     except (OSError, ValueError):
         return ""
 
