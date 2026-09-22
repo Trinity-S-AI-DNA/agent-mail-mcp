@@ -519,6 +519,7 @@ full message bodies.
 | `Enter a valid description` in the console | punctuation in the Description field; use letters and spaces |
 | `API HTTP 403` on a valid token | the refresh token was minted with narrower scopes — redo step 3 |
 | `403` on `send` only, reads fine | the grant has no `ZohoMail.messages.CREATE`; check `zmail whoami` → `can_send`, then redo steps 3–4. A refresh cannot add it |
+| `can_send` still `false` right after redoing steps 3–4 | it should not be, any more: the cached access token keeps the old scope for up to an hour, so the cache is keyed to the grant that filled it and a re-mint discards it. If you see this on an older checkout, `rm ~/.cache/zoho-mail-agent/token.json` |
 | `send` returns `"dryRun": true` | working as designed — add `--send` (CLI) or `confirm=true` (MCP) |
 | bridge: `chat not found` | a bot cannot open a chat — message it in Telegram first, then re-run `./bridge-setup.sh` |
 | bridge: token rejected, 401/404 | wrong or revoked BotFather token, often a trailing space — re-run `./bridge-setup.sh` |
