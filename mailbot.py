@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import botops  # noqa: E402  -- the inbound half
 import tgapi  # noqa: E402   -- transport, state, and who may act
 import zmail  # noqa: E402  -- same directory, one implementation of the mail API
+from agent_mail_spec import BRIDGE_DRAFT_WITH_PUSH  # noqa: E402  -- the law, from spec/agent_mail.t27
 from tgapi import load_state, log, recipients, save_state, telegram  # noqa: E402
 
 INBOX_TYPE = "Inbox"
@@ -136,8 +137,20 @@ def migrate_seen(state: dict, chats: list[str]) -> dict:
     return dict(seen or {})
 
 
-def sweep(aid: str, folder: str, state: dict, limit: int = 25) -> int:
-    """One poll. Returns how many notifications went out, across all recipients."""
+def sweep(aid: str, folder: str, state: dict, limit: int = 25,
+          draft_push: bool | None = None) -> int:
+    """One poll. Returns how many notifications went out, across all recipients.
+
+    draft_push follows the BRIDGE_DRAFT_WITH_PUSH law from spec/agent_mail.t27
+    unless a caller needs to override it; --feed-only does, because commands are
+    disabled there and a draft window whose buttons do nothing is noise. When
+    the law is on, an owner's notification is immediately followed by the
+    drafted reply -- a proposal under the letter, never sent without the
+    owner's own press. Drafting runs on the sweep thread by design (one state
+    writer), so a slow model delays the next poll; the log carries the timing.
+    """
+    if draft_push is None:
+        draft_push = BRIDGE_DRAFT_WITH_PUSH
     data = zmail.api(f"/accounts/{aid}/messages/view",
                      {"limit": limit, "start": 1, "folderId": folder}).get("data") or []
     msgs = [zmail.summary(m) | {"folderId": folder} for m in data]
@@ -188,6 +201,12 @@ def sweep(aid: str, folder: str, state: dict, limit: int = 25) -> int:
             known.add(str(m["messageId"]))
             sent += 1
             log(f"notified chat {chat}: {m.get('subject')!r} from {m.get('from')}")
+            if draft_push and tgapi.is_owner(chat):
+                t0 = time.monotonic()
+                botops.open_reply(chat, aid, folder, str(m["messageId"]), state,
+                                  announce=False)
+                log(f"push draft for chat {chat}: {m.get('subject')!r} "
+                    f"in {time.monotonic() - t0:.0f}s")
         # Bounded: the set only needs to cover what a `view` call can return, and
         # an unbounded list would grow until the state file is the slowest part
         # of a sweep.
@@ -313,7 +332,7 @@ def main():
         state = load_state()
         if time.monotonic() - last >= a.interval:
             try:
-                sweep(aid, folder, state)
+                sweep(aid, folder, state, draft_push=not a.feed_only)
             except SystemExit:
                 raise
             except Exception as e:  # noqa: BLE001 -- a watcher that dies on a blip is useless

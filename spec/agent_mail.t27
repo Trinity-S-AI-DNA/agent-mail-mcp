@@ -128,6 +128,26 @@ pub const SEARCH_FIELDS: [2]str = [entire, content];
 pub const SEARCH_OPERATORS: [1]str = [contains];
 
 // ============================================================================
+// Bridge -- the push half (mailbot.py)
+//
+// The MCP tools above are pull: an agent sees mail when it looks. The bridge
+// pushes it, and this section is where its one behavioural law lives, so that
+// "what does a notification carry" has the same single home as "what does a
+// tool accept". The generated constant is imported by mailbot.py; the two
+// cannot drift apart because test_spec fails if this file and
+// agent_mail_spec.py disagree.
+// ============================================================================
+
+/// Does the drafted reply travel WITH the push, or after the owner presses
+/// the reply button? true: every letter arrives with a draft already under
+/// it -- for owner chats only, and it is still a proposal: nothing leaves
+/// without the owner's own press on Send, exactly as before. false: the old
+/// shape, a preview plus the reply button that opens the draft.
+/// Owner's request, 2026-09-29: all mail through the bot, with a proposed
+/// reply attached to every push.
+pub const BRIDGE_DRAFT_WITH_PUSH: bool = true;
+
+// ============================================================================
 // Tool kinds
 // ============================================================================
 

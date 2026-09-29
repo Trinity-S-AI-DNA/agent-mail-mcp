@@ -231,11 +231,16 @@ re-entering the token:
 ### Answering from the chat
 
 Every notification carries two buttons: **✍️ Ответить** and **📄 Полностью**.
-Pressing reply drafts an answer, shows it to you, and stops:
+For an owner's chat the drafted answer usually arrives **with the letter** —
+`BRIDGE_DRAFT_WITH_PUSH` in [`spec/agent_mail.t27`](spec/agent_mail.t27) is on,
+so the draft is already under the notification and the reply button is only for
+a second try. Read-only recipients always get the old shape: a preview and
+buttons, no draft (an observer cannot act on one anyway). Either way, what you
+see is a proposal:
 
 ```
-✍️ Ответить  →  draft appears  →  ✏️ Исправить (rewrite it yourself)
-                              →  📤 Отправить  →  the letter leaves
+letter arrives  →  draft already under it  →  ✏️ Исправить (rewrite it yourself)
+                                         →  📤 Отправить  →  the letter leaves
 ```
 
 **Nothing is ever sent without that last press.** The letter being answered is a

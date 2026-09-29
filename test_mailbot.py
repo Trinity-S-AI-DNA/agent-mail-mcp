@@ -95,10 +95,14 @@ def mail(i):
             "received": "", "folderId": "f"}
 
 
-def sweep():
+def sweep(draft_push: bool = False):
+    # draft_push defaults to False here, not to the spec's law, because these
+    # helpers serve the fan-out tests, which measure deliveries; drafts would
+    # only pollute the state the two-way tests read. The push-draft law has
+    # its own test, which passes True explicitly.
     SENT.clear()
     BODY_FETCHES.clear()
-    n = mailbot.sweep("acct", "f", tgapi.load_state())
+    n = mailbot.sweep("acct", "f", tgapi.load_state(), draft_push=draft_push)
     return n, sorted(SENT)
 
 
@@ -195,6 +199,43 @@ def test_authority():
 
 
 # ------------------------------------------------------------------ reply flow
+
+def test_push_draft():
+    # The law from spec/agent_mail.t27: with BRIDGE_DRAFT_WITH_PUSH a fresh
+    # letter carries its drafted reply to the owner's chat, and only there --
+    # an observer on the feed gets the notification alone.
+    global MSGS
+    KEYS["telegram_chat_id"], KEYS["telegram_owner_id"] = "111 222", "111"
+    MSGS = [mail(21)]
+    tgapi.save_state({"initialised": True, "seen": {"111": [], "222": []}})
+
+    n, to = sweep(draft_push=True)
+    st = tgapi.load_state()
+    drafts = st.get("drafts") or {}
+    check("push drafting does not change who is notified",
+          n == 2 and to == ["111", "222"], (n, to))
+    check("one draft exists, for the owner's chat",
+          len(drafts) == 1 and all(d["chat"] == "111" for d in drafts.values()), drafts)
+    d = next(iter(drafts.values()), {})
+    check("the push draft is a reply to the pushed letter",
+          d.get("reply_to") == "21" and d.get("to") == "s21@ex.com", d)
+    check("the observer got the notification only, no draft view",
+          all("Черновик" not in t and "предложенный ответ" not in t for c, t in OUT
+              if c == "222"), [t for c, t in OUT if c == "222"])
+    check("the draft never mailed anything", MAILED == [], MAILED)
+
+    tgapi.save_state({"initialised": True, "seen": {"111": [], "222": []}})
+    n, to = sweep(draft_push=False)
+    check("with the law off the old shape returns: no drafts",
+          n == 2 and not (tgapi.load_state().get("drafts") or {}),
+          (n, tgapi.load_state().get("drafts")))
+
+    import agent_mail_spec
+    check("the law imports as a real bool, not a truthy string",
+          isinstance(agent_mail_spec.BRIDGE_DRAFT_WITH_PUSH, bool)
+          and agent_mail_spec.BRIDGE_DRAFT_WITH_PUSH is True,
+          repr(agent_mail_spec.BRIDGE_DRAFT_WITH_PUSH))
+
 
 def test_reply_flow():
     global MSGS

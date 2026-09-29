@@ -105,8 +105,19 @@ def collect(ast):
                         f"{name}: value is {literal['kind']}, not a literal. "
                         f"Only literal constants can be generated from.")
                 value = literal["value"]
-                consts[name] = int(value) if node["extra_type"] in (
-                    "usize", "u8", "u32", "u64", "isize") else value
+                if node["extra_type"] in ("usize", "u8", "u32", "u64", "isize"):
+                    consts[name] = int(value)
+                elif node["extra_type"] == "bool":
+                    # The parser hands a bool literal over as the word 'true'
+                    # or 'false'. Keeping it a string would be a trap: 'false'
+                    # is a truthy string, so a law switched off in the spec
+                    # would stay on in every `if CONST` that reads it.
+                    if value not in ("true", "false"):
+                        raise SpecError(f"{name}: bool literal is {value!r}, "
+                                        "expected true or false")
+                    consts[name] = value == "true"
+                else:
+                    consts[name] = value
         elif kind == "StructDecl":
             structs[name] = [(f["name"], f["extra_type"]) for f in node["children"]]
             order.append(name)

@@ -6,6 +6,7 @@ file and the spec disagree.
 
 # --- laws -------------------------------------------------------------
 BODY_TRUNCATE_DEFAULT = 20000
+BRIDGE_DRAFT_WITH_PUSH = True
 LIMIT_DEFAULT = 25
 LIMIT_MAX = 200
 LIMIT_MIN = 1

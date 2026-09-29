@@ -232,17 +232,33 @@ def reply_address(m: dict) -> str | None:
     return found[0] if found else None
 
 
-def open_reply(chat: str, aid: str, folder: str, mid: str, state: dict):
+def open_reply(chat: str, aid: str, folder: str, mid: str, state: dict,
+               announce: bool = True):
+    """Open the reply window for one letter.
+
+    announce=True is the interactive path -- a button was pressed, the owner is
+    waiting, so every step talks back. announce=False is the push path: the
+    notification itself is the announcement, and a letter that cannot be
+    answered (no parseable sender) gets a log line instead of a second message
+    on top of the one just delivered.
+    """
     m = find_message(aid, folder, mid)
     if not m:
-        send(chat, f"Не нашёл письмо <code>{html.escape(str(mid))}</code> во входящих.")
+        if announce:
+            send(chat, f"Не нашёл письмо <code>{html.escape(str(mid))}</code> во входящих.")
+        else:
+            log(f"push draft skipped for {mid}: not in the Inbox")
         return
     to = reply_address(m)
     if not to:
-        send(chat, "В письме нет разбираемого адреса отправителя — отвечать некуда.")
+        if announce:
+            send(chat, "В письме нет разбираемого адреса отправителя — отвечать некуда.")
+        else:
+            log(f"push draft skipped for {mid}: no parseable sender")
         return
 
-    send(chat, "⏳ Готовлю черновик…")
+    if announce:
+        send(chat, "⏳ Готовлю черновик…")
     try:
         body = fetch_body(aid, folder, mid)
     except SystemExit:
