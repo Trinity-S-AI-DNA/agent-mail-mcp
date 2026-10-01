@@ -75,6 +75,7 @@ def _send_mail(aid, **kw):
     return {"sent": True, "messageId": "999"}
 
 
+REAL_SEND_MAIL = zmail.send_mail   # the attachment tests need the real one
 zmail.api = _api
 zmail.send_mail = _send_mail
 tgapi.telegram = _telegram
@@ -304,6 +305,74 @@ def test_send_refusals():
           not (tgapi.load_state().get("drafts") or {}), tgapi.load_state().get("drafts"))
 
 
+def test_attachments():
+    """The upload path, against a stubbed Zoho: what is uploaded, what the send
+    payload names, and the refusals that must happen before anything leaves."""
+    tmp = tempfile.mkdtemp()
+    a = os.path.join(tmp, "a.zip")
+    with open(a, "wb") as fh:
+        fh.write(b"PK\x03\x04 not really a zip")
+    uploads, posts = [], []
+    real_upload, real_post = zmail.api_upload, zmail.api_post
+    zmail.api_upload = lambda aid, path: (uploads.append(path) or {
+        "storeName": "s1", "attachmentPath": "/p/1", "attachmentName": os.path.basename(path)})
+    zmail.api_post = lambda path, payload: (posts.append((path, payload)) or
+                                            {"data": {"messageId": "m1"}, "status": {}})
+    kw = dict(to="x@ex.com", subject="s", content="b", mail_format="plaintext",
+              cc=None, bcc=None, from_address="admin@t27.ai")
+
+    def refused(**extra):
+        try:
+            REAL_SEND_MAIL("acct", **kw, **extra)
+        except SystemExit:
+            return True
+        return False
+
+    try:
+        dry = REAL_SEND_MAIL("acct", **kw, reply_to=None, really_send=False, attachments=[a])
+        att = dry["wouldSend"]["attachments"]
+        check("the dry run lists the file with size and sha256 and uploads nothing",
+              uploads == [] and posts == [] and len(att) == 1
+              and att[0]["bytes"] == os.path.getsize(a) and len(att[0]["sha256"]) == 64, dry)
+
+        check("a missing attachment stops the dry run",
+              refused(reply_to=None, really_send=False,
+                      attachments=[os.path.join(tmp, "nope.zip")]))
+        check("a missing attachment stops a real send before any upload",
+              refused(reply_to=None, really_send=True,
+                      attachments=[a, os.path.join(tmp, "nope.zip")])
+              and uploads == [] and posts == [], (uploads, posts))
+        os.makedirs(os.path.join(tmp, "d"))
+        b = os.path.join(tmp, "d", "a.zip")
+        with open(b, "wb") as fh:
+            fh.write(b"other")
+        check("two files with one name are refused",
+              refused(reply_to=None, really_send=True, attachments=[a, b]) and uploads == [])
+
+        res = REAL_SEND_MAIL("acct", **kw, reply_to="777", really_send=True, attachments=[a])
+        path, payload = posts[0]
+        check("a real send uploads first, then names the upload in the reply",
+              uploads == [os.path.abspath(a)] and path.endswith("/messages/777")
+              and payload.get("action") == "reply"
+              and payload.get("attachments") == [
+                  {"storeName": "s1", "attachmentPath": "/p/1", "attachmentName": "a.zip"}]
+              and res["attachments"][0]["sha256"] == att[0]["sha256"], (path, payload))
+
+        import mcp_server  # noqa: E402
+        seen = []
+        real_run, mcp_server.run_zmail = mcp_server.run_zmail, lambda c: (seen.append(c) or (True, "{}"))
+        try:
+            mcp_server.call_tool("mail_send", {"to": "x", "subject": "s", "body": "b",
+                                               "attach": f"{a}\n\n/tmp/with, comma.txt\n"})
+        finally:
+            mcp_server.run_zmail = real_run
+        check("mail_send passes one --attach per line, commas intact",
+              seen and seen[0].count("--attach") == 2 and "/tmp/with, comma.txt" in seen[0]
+              and "--send" not in seen[0], seen)
+    finally:
+        zmail.api_upload, zmail.api_post = real_upload, real_post
+
+
 def test_draft_hygiene():
     st = tgapi.load_state()
     st["drafts"] = {"old": {"created": time.time() - botops.DRAFT_TTL - 60, "body": "x"}}
@@ -461,6 +530,7 @@ def main():
     print()
     test_reply_flow()
     test_send_refusals()
+    test_attachments()
     test_draft_hygiene()
     test_poll_offset()
     print()

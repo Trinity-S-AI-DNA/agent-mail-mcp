@@ -416,6 +416,26 @@ zmail send -t her@example.com -s "Re: Subject" --body-file r.md --reply-to <mess
 sentence: real letters carry newlines, quotes and em-dashes, and a shell argument is
 where those get silently mangled. `--html` switches the body from plain text to HTML.
 
+Attachments: `-a FILE` (`--attach`), repeated for several; over MCP, `attach` takes one
+path per line.
+
+```bash
+zmail send -t her@example.com -s "Re: Subject" --body-file r.md --reply-to <messageId> \
+  -a results.zip -a notes.pdf --send
+```
+
+Every file is checked before anything is uploaded, so a missing path or two files with
+the same name stop the send whole rather than producing a letter that says "attached"
+and arrives without it. The dry run lists each file by path, size and sha256 and uploads
+nothing. On `--send`, each file goes to Zoho's attachment store first
+(`/messages/attachments`), and the send then names it. That upload needs the same
+`ZohoMail.messages.CREATE` scope as the send itself.
+
+Measured on 2026-10-01, by sending to this account's own address and hashing what
+arrived: a 1,284,904-byte zip came back byte-identical, but a 38-byte `.txt` came back
+as 39 bytes, because Zoho rewrites LF line endings to CRLF in text attachments. If the
+recipient will check a hash, send text files inside an archive.
+
 JSON on stdout, errors on stderr with a non-zero exit — so a caller branches on the
 exit code instead of parsing prose.
 
@@ -425,7 +445,8 @@ exit code instead of parsing prose.
 `mail_read` · `mail_send`
 
 Only `mail_send` changes anything outside this machine, and only when called with
-`confirm=true`.
+`confirm=true`. Its `attach` argument sends local files with the letter, so the dry run
+lists every one of them for the human to see before the send is confirmed.
 
 ### Changing a tool
 

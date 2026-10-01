@@ -17,7 +17,8 @@ Commands
   zmail list [-n N] [-f FOLDER]      newest N message summaries (default 25)
   zmail read <messageId> [-F fid]    one message, headers plus plain-text body
   zmail search <query> [-n N]        Zoho search syntax, newest first
-  zmail send -t TO -s SUBJ ...       compose a message; DRY RUN unless --send
+  zmail send -t TO -s SUBJ ...       compose a message; DRY RUN unless --send;
+                                     -a FILE attaches (repeat for several)
   zmail whoami                       token state and scope, no secrets
 
 Every command prints JSON on stdout. Errors go to stderr with a non-zero exit, so a
@@ -285,6 +286,71 @@ def api_post(path: str, payload: dict) -> dict:
         die(f"API HTTP {e.code} on {path}: {detail}")
 
 
+def api_upload(aid: str, path: str) -> dict:
+    """Upload one file to Zoho's attachment store; return what the send payload needs.
+
+    Zoho does not take file bytes in the send call. The file goes up first, as a
+    raw body to /messages/attachments?fileName=..., and the send then names it by
+    the storeName / attachmentPath that this upload returned. The upload needs the
+    same ZohoMail.messages.CREATE scope as the send, so a read-only grant fails
+    here, before any letter exists, with the same named error.
+    """
+    name = os.path.basename(path)
+    url = (f"{API_HOST}/api/accounts/{aid}/messages/attachments?"
+           + urllib.parse.urlencode({"fileName": name}))
+    with open(path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Authorization": f"Zoho-oauthtoken {access_token()}",
+        "Accept": "application/json",
+        "Content-Type": "application/octet-stream",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            resp = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:600]
+        hint = (f"\n\nSending and uploading both need {SEND_SCOPE}; check `zmail whoami`."
+                if e.code in (401, 403) else "")
+        die(f"API HTTP {e.code} uploading {name!r}; nothing was sent: {detail}{hint}")
+    d = resp.get("data")
+    if isinstance(d, list):          # the multipart form answers with a list
+        d = d[0] if d else None
+    if not d or not d.get("storeName") or not d.get("attachmentPath"):
+        die(f"upload of {name!r} returned no storeName/attachmentPath; nothing was sent: "
+            f"{json.dumps(resp)[:600]}")
+    return {"storeName": d["storeName"], "attachmentPath": d["attachmentPath"],
+            "attachmentName": d.get("attachmentName") or name}
+
+
+def inspect_attachments(paths: list[str]) -> list[dict]:
+    """Check every file BEFORE anything is uploaded, and describe it for the preview.
+
+    All-or-nothing on purpose: a letter that says "attached" and arrives without
+    the file is worse than a letter that has not left yet. The sha256 is what lets
+    the human, and the recipient, tell this file from the one beside it.
+    """
+    found = []
+    for raw in paths:
+        path = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isfile(path):
+            die(f"attachment {raw!r} is not a regular file; nothing was sent")
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+        except OSError as e:
+            die(f"cannot read attachment {raw!r}: {e}; nothing was sent")
+        found.append({"path": path, "name": os.path.basename(path),
+                      "bytes": os.path.getsize(path), "sha256": h.hexdigest()})
+    names = [a["name"] for a in found]
+    if len(set(names)) != len(names):
+        die(f"two attachments share a file name ({names}); the recipient could not "
+            f"tell them apart. Rename one; nothing was sent")
+    return found
+
+
 def account_id() -> str:
     if os.environ.get("ZOHO_ACCOUNT_ID"):
         return os.environ["ZOHO_ACCOUNT_ID"]
@@ -419,7 +485,8 @@ def read_body(inline: str | None, path: str | None) -> str:
 
 def send_mail(aid: str, *, to: str, subject: str, content: str, mail_format: str,
               cc: str | None, bcc: str | None, from_address: str | None,
-              reply_to: str | None, really_send: bool) -> dict:
+              reply_to: str | None, really_send: bool,
+              attachments: list[str] | None = None) -> dict:
     """Compose and (only with really_send) transmit one message.
 
     The dry run is the DEFAULT on purpose. Every other verb in this file is
@@ -428,6 +495,10 @@ def send_mail(aid: str, *, to: str, subject: str, content: str, mail_format: str
     to be what happens when a caller forgets the flag, not what happens when
     they remember it.
     """
+    # Files are checked before the From lookup and before the dry-run return, so a
+    # wrong path is caught by the preview rather than by the real send.
+    files = inspect_attachments(attachments or [])
+
     if not from_address:
         data = api("/accounts").get("data") or []
         from_address = (data[0].get("primaryEmailAddress") if data else None)
@@ -458,6 +529,7 @@ def send_mail(aid: str, *, to: str, subject: str, content: str, mail_format: str
         "mailFormat": mail_format,
         "body_chars": len(content),
         "replyToMessageId": reply_to,
+        "attachments": [{k: a[k] for k in ("path", "bytes", "sha256")} for a in files],
     }
 
     if not really_send:
@@ -483,6 +555,9 @@ def send_mail(aid: str, *, to: str, subject: str, content: str, mail_format: str
                 "Run `zmail whoami` first, which mints a token and records it.")
         return res
 
+    if files:
+        payload["attachments"] = [api_upload(aid, a["path"]) for a in files]
+
     if reply_to:
         payload["action"] = "reply"
         resp = api_post(f"/accounts/{aid}/messages/{reply_to}", payload)
@@ -500,6 +575,7 @@ def send_mail(aid: str, *, to: str, subject: str, content: str, mail_format: str
         "subject": preview["subject"],
         "to": preview["to"],
         "status": (resp.get("status") or {}).get("description"),
+        "attachments": preview["attachments"],
         "note": "verify independently: the message should now be in Sent (`zmail list -f <sentFolderId>`)",
     }
 
@@ -564,6 +640,8 @@ def main():
     p.add_argument("--html", action="store_true", help="send as HTML instead of plain text")
     p.add_argument("--reply-to", metavar="MESSAGE_ID",
                    help="thread the message as a reply to this messageId")
+    p.add_argument("-a", "--attach", action="append", metavar="PATH", default=[],
+                   help="attach a local file; repeat for several")
     p.add_argument("--send", action="store_true",
                    help="actually transmit; without it the payload is only printed")
 
@@ -621,7 +699,7 @@ def main():
             content=read_body(a.body, a.body_file),
             mail_format="html" if a.html else "plaintext",
             cc=a.cc, bcc=a.bcc, from_address=a.from_address,
-            reply_to=a.reply_to, really_send=a.send,
+            reply_to=a.reply_to, really_send=a.send, attachments=a.attach,
         ))
         return
 

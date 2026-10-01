@@ -106,6 +106,11 @@ def call_tool(name: str, args: dict) -> tuple[bool, str]:
         cmd += opt("--reply-to", "reply_to")
         if args.get("html"):
             cmd.append("--html")
+        # One path per line: a comma is legal in a file name, a newline is not
+        # something anyone puts in one on purpose.
+        for path in str(args.get("attach") or "").splitlines():
+            if path.strip():
+                cmd += ["--attach", path.strip()]
         # confirm must be literally true. A truthy string like "no" or "false"
         # arriving from a sloppy caller would otherwise send a real letter.
         if args.get("confirm") is True:
