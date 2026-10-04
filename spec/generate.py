@@ -73,10 +73,23 @@ def array_elements(node):
     count so a silent truncation cannot pass.
     """
     child = node["children"][0]
-    text = child["name"].strip()
-    if not (text.startswith("[") and text.endswith("]")):
-        raise SpecError(f"{node['name']}: expected an array literal, got {text!r}")
-    items = [x.strip() for x in text[1:-1].split(",") if x.strip()]
+    if child["kind"] == "ExprArrayLiteral":
+        # The t27c built on 2026-10-02 emits a real array node, one child per
+        # element, where the joined-text form below comes back empty. The gate
+        # went red on an unchanged spec because only that form was read. Both
+        # are accepted; a bare word is still the only element type.
+        items = []
+        for el in child["children"]:
+            if el["kind"] != "ExprIdentifier":
+                raise SpecError(
+                    f"{node['name']}: element is {el['kind']}, not a bare word. "
+                    f"Only bare words are generated from.")
+            items.append(el["name"])
+    else:
+        text = child["name"].strip()
+        if not (text.startswith("[") and text.endswith("]")):
+            raise SpecError(f"{node['name']}: expected an array literal, got {text!r}")
+        items = [x.strip() for x in text[1:-1].split(",") if x.strip()]
     declared = re.match(r"\[(\d+)\]", node["extra_type"])
     if declared and int(declared.group(1)) != len(items):
         raise SpecError(
