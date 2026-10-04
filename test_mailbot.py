@@ -373,6 +373,114 @@ def test_attachments():
         zmail.api_upload, zmail.api_post = real_upload, real_post
 
 
+def test_attachment_download():
+    """The download path, against a stubbed Zoho: listing writes nothing, a save
+    arrives whole and hashed, and every refusal comes before the first byte."""
+    import hashlib
+    tmp = tempfile.mkdtemp()
+    letter = {}   # attachmentId -> (name as Zoho lists it, bytes)
+    fetched = []
+    real_api, real_chunks = zmail.api, zmail.api_chunks
+
+    def fake_api(path, params=None):
+        if path.endswith("/attachmentinfo"):
+            return {"data": {"attachments": [
+                {"attachmentId": k, "attachmentName": n, "attachmentSize": len(b)}
+                for k, (n, b) in letter.items()]}}
+        return real_api(path, params)
+
+    def fake_chunks(path):
+        att = path.rsplit("/", 1)[1]
+        fetched.append(att)
+        data = letter[att][1]
+        yield data[:3]     # more than one block, as a real download is
+        yield data[3:]
+
+    def refused(dest, only=None):
+        try:
+            zmail.save_attachments("acct", "f", "42", dest, only)
+        except SystemExit:
+            return True
+        return False
+
+    zmail.api, zmail.api_chunks = fake_api, fake_chunks
+    try:
+        payload = b"PK\x03\x04 board vectors"
+        letter.update({"1": ("vectors.zip", payload), "2": ("draft.pdf", b"%PDF-1.5")})
+        listed = zmail.list_attachments("acct", "f", "42")
+        check("listing reports names and sizes and downloads nothing",
+              [(a["name"], a["listed_bytes"]) for a in listed]
+              == [("vectors.zip", len(payload)), ("draft.pdf", 8)] and fetched == [], listed)
+
+        d1 = os.path.join(tmp, "one")
+        saved = zmail.save_attachments("acct", "f", "42", d1, ["vectors.zip"])
+        got = open(os.path.join(d1, "vectors.zip"), "rb").read()
+        check("--name saves only that file, whole, with the sha256 of what arrived",
+              fetched == ["1"] and got == payload and len(saved) == 1
+              and saved[0]["sha256"] == hashlib.sha256(payload).hexdigest()
+              and saved[0]["bytes"] == saved[0]["listed_bytes"] == len(payload)
+              and sorted(os.listdir(d1)) == ["vectors.zip"], (saved, os.listdir(d1)))
+
+        fetched.clear()
+        check("a file that already exists is refused, and nothing is downloaded",
+              refused(d1) and fetched == [] and sorted(os.listdir(d1)) == ["vectors.zip"]
+              and open(os.path.join(d1, "vectors.zip"), "rb").read() == payload,
+              (fetched, os.listdir(d1)))
+
+        check("an unknown --name is refused before any download",
+              refused(os.path.join(tmp, "two"), ["nope.zip"]) and fetched == []
+              and not os.path.exists(os.path.join(tmp, "two")))
+
+        letter.clear()
+        letter.update({"1": ("../../escape.txt", b"x"), "2": (".bashrc", b"y"),
+                       "3": ("C:\\evil\\win.ini", b"z")})
+        d3 = os.path.join(tmp, "three")
+        saved = zmail.save_attachments("acct", "f", "42", d3)
+        check("hostile names land inside the directory, dot-files made visible",
+              sorted(os.listdir(d3)) == ["_.bashrc", "escape.txt", "win.ini"]
+              and not os.path.exists(os.path.join(tmp, "escape.txt"))
+              and {e.get("renamed_from") for e in saved}
+              == {"../../escape.txt", ".bashrc", "C:\\evil\\win.ini"}, os.listdir(d3))
+
+        letter.clear()
+        letter.update({"1": ("a/x.bin", b"1"), "2": ("b/x.bin", b"2")})
+        fetched.clear()
+        check("two attachments that would share one file name are refused before download",
+              refused(os.path.join(tmp, "four")) and fetched == [])
+
+        letter.clear()
+        fetched.clear()
+        check("a letter with nothing attached saves nothing",
+              refused(os.path.join(tmp, "five")) and fetched == [])
+    finally:
+        zmail.api, zmail.api_chunks = real_api, real_chunks
+
+    import mcp_server  # noqa: E402
+    seen = []
+    real_run, mcp_server.run_zmail = mcp_server.run_zmail, lambda c: (seen.append(c) or (True, "{}"))
+    try:
+        mcp_server.call_tool("mail_attachments", {"message_id": "42"})
+        mcp_server.call_tool("mail_attachments", {"message_id": "42", "save": "true"})
+        mcp_server.call_tool("mail_attachments", {"message_id": "42", "save": True,
+                                                  "name": "a.zip\n\nb.pdf\n"})
+        bad_id = mcp_server.call_tool("mail_attachments", {"message_id": "../../.ssh", "save": True})
+        stray = mcp_server.call_tool("mail_attachments", {"message_id": "42", "name": "a.zip"})
+    finally:
+        mcp_server.run_zmail = real_run
+    root = os.path.join(os.path.expanduser(mcp_server.ATTACHMENT_ROOT), "42")
+    check("mail_attachments lists unless save is literally true",
+          len(seen) >= 2 and "--save" not in seen[0] and "--save" not in seen[1], seen[:2])
+    check("save=true writes only under ATTACHMENT_ROOT/<messageId>, one --name per line",
+          len(seen) == 3 and seen[2][seen[2].index("--save") + 1] == root
+          and seen[2].count("--name") == 2, seen)
+    check("a messageId that is not digits never becomes a directory",
+          bad_id[0] is False and stray[0] is False and len(seen) == 3, (bad_id, stray))
+    check("mail_attachments is read_only, and the description names its fixed directory",
+          mcp_server.TOOL_KIND["mail_attachments"] == "read_only"
+          and mcp_server.ATTACHMENT_ROOT in next(t["description"] for t in mcp_server.TOOLS
+                                           if t["name"] == "mail_attachments"))
+
+
 def test_draft_hygiene():
     st = tgapi.load_state()
     st["drafts"] = {"old": {"created": time.time() - botops.DRAFT_TTL - 60, "body": "x"}}
@@ -531,6 +639,7 @@ def main():
     test_reply_flow()
     test_send_refusals()
     test_attachments()
+    test_attachment_download()
     test_draft_hygiene()
     test_poll_offset()
     print()

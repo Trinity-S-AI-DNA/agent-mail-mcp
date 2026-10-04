@@ -16,6 +16,9 @@ Commands
   zmail folders                      folder list with ids and unread counts
   zmail list [-n N] [-f FOLDER]      newest N message summaries (default 25)
   zmail read <messageId> [-F fid]    one message, headers plus plain-text body
+  zmail attachments <messageId>      list a message's attachments; with
+        [-F fid] [--save DIR]        --save, download them into DIR (never
+        [--name NAME]...             overwriting) and report bytes and sha256
   zmail search <query> [-n N]        Zoho search syntax, newest first
   zmail send -t TO -s SUBJ ...       compose a message; DRY RUN unless --send;
                                      -a FILE attaches (repeat for several)
@@ -360,6 +363,143 @@ def account_id() -> str:
     return str(data[0]["accountId"])
 
 
+def locate(aid: str, message_id: str, folder: str | None) -> tuple[str, dict | None]:
+    """Folder id and summary headers for one message.
+
+    Every per-message endpoint is addressed through its folder, and a caller
+    usually has only the messageId. The summary view is the one place both
+    the folder and the headers live, so one scan of the newest
+    MESSAGE_LOOKUP_WINDOW serves both.
+    """
+    head = None
+    for m in (api(f"/accounts/{aid}/messages/view",
+                  {"limit": MESSAGE_LOOKUP_WINDOW, "start": 1}).get("data") or []):
+        if str(m.get("messageId")) == str(message_id):
+            head, folder = m, folder or m.get("folderId")
+            break
+    if not folder:
+        die(f"message {message_id} not in the newest {MESSAGE_LOOKUP_WINDOW}; "
+            f"pass -F <folderId>")
+    return str(folder), head
+
+
+def api_chunks(path: str):
+    """Yield the raw body of one GET in blocks. For attachments, which are bytes,
+    not JSON, and can be larger than anything worth holding in memory twice.
+
+    Downloading needs only ZohoMail.messages.READ, the scope every grant here
+    already has, so a read-only token can fetch what it can read.
+    """
+    req = urllib.request.Request(f"{API_HOST}/api{path}", headers={
+        "Authorization": f"Zoho-oauthtoken {access_token()}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            for block in iter(lambda: r.read(1 << 20), b""):
+                yield block
+    except urllib.error.HTTPError as e:
+        die(f"API HTTP {e.code} on {path}: {e.read().decode(errors='replace')[:600]}")
+
+
+def safe_name(name: str, fallback: str) -> str:
+    """A file name chosen by a stranger, made safe to create in a directory we chose.
+
+    The sender picks the attachment name, so it is treated like the body: data,
+    not instructions. Only the last path component survives (`../../x` and
+    `a\\b` both reduce to a plain name), control characters become `_`, and a
+    leading dot gets a `_` in front so a letter cannot plant a hidden file such
+    as `.zshrc` in the target directory.
+    """
+    import re
+    base = re.split(r"[/\\]", name or "")[-1]
+    base = re.sub(r"[\x00-\x1f\x7f]", "_", base).strip()
+    if base in ("", ".", ".."):
+        return fallback
+    if base.startswith("."):
+        base = "_" + base
+    return base
+
+
+def list_attachments(aid: str, folder: str, message_id: str) -> list[dict]:
+    """The message's attachments as Zoho lists them. Reads metadata only; no bytes."""
+    resp = api(f"/accounts/{aid}/folders/{folder}/messages/{message_id}/attachmentinfo")
+    data = resp.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("attachments", []), list):
+        die(f"attachmentinfo for {message_id} has an unexpected shape: "
+            f"{json.dumps(resp)[:600]}")
+    found = []
+    for a in data.get("attachments") or []:
+        size = a.get("attachmentSize")
+        found.append({
+            "attachmentId": str(a.get("attachmentId")),
+            "name": a.get("attachmentName"),
+            "listed_bytes": int(size) if str(size).isdigit() else None,
+        })
+    return found
+
+
+def save_attachments(aid: str, folder: str, message_id: str, dest: str,
+                     only: list[str] | None = None) -> list[dict]:
+    """Download attachments into dest. Never overwrites, and refuses before any byte.
+
+    Every refusal happens before the first download: a name asked for that is
+    not on the letter, two attachments that would land on one file name, or a
+    target that already exists. A refused run writes nothing. A network failure
+    partway through keeps the files already completed and loses only the one in
+    flight: its bytes go to `<name>.part`, which gets the real name only once it
+    is complete, and that link fails rather than replace a file that appeared in
+    between. So a file under its real name is always a whole download.
+    """
+    listed = list_attachments(aid, folder, message_id)
+    if not listed:
+        die(f"message {message_id} has no attachments")
+    if only:
+        names = {a["name"] for a in listed}
+        missing = [n for n in only if n not in names]
+        if missing:
+            die(f"no attachment named {missing} on {message_id}; it has {sorted(names)}. "
+                f"Nothing was saved")
+        listed = [a for a in listed if a["name"] in only]
+
+    dest = os.path.abspath(os.path.expanduser(dest))
+    plan = []
+    for a in listed:
+        local = safe_name(a["name"], f"attachment-{a['attachmentId']}")
+        plan.append((a, local, os.path.join(dest, local)))
+    targets = [t for _, _, t in plan]
+    if len(set(targets)) != len(targets):
+        die(f"two attachments would be saved under one name ({[l for _, l, _ in plan]}); "
+            f"fetch them one at a time with --name into separate directories. "
+            f"Nothing was saved")
+    taken = [t for t in targets if os.path.lexists(t) or os.path.lexists(t + ".part")]
+    if taken:
+        die(f"refusing to overwrite {taken}; move them or pick another directory. "
+            f"Nothing was saved")
+
+    os.makedirs(dest, exist_ok=True)
+    saved = []
+    for a, local, target in plan:
+        part = target + ".part"
+        h, n = hashlib.sha256(), 0
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                for block in api_chunks(f"/accounts/{aid}/folders/{folder}/messages/"
+                                        f"{message_id}/attachments/{a['attachmentId']}"):
+                    fh.write(block)
+                    h.update(block)
+                    n += len(block)
+            os.link(part, target)
+        finally:
+            os.unlink(part)
+        entry = {"name": local, "path": target, "bytes": n,
+                 "listed_bytes": a["listed_bytes"], "sha256": h.hexdigest()}
+        if local != a["name"]:
+            entry["renamed_from"] = a["name"]
+        saved.append(entry)
+    return saved
+
+
 def strip_html(s: str) -> str:
     import html
     import re
@@ -624,6 +764,14 @@ def main():
     p.add_argument("--max-chars", type=int, default=BODY_TRUNCATE_DEFAULT,
                    help=f"truncate the body at N chars (default {BODY_TRUNCATE_DEFAULT})")
 
+    p = sub.add_parser("attachments", help="list a message's attachments, or save them")
+    p.add_argument("message_id")
+    p.add_argument("-F", "--folder", required=False, help="folder id (looked up if omitted)")
+    p.add_argument("--save", metavar="DIR",
+                   help="download into DIR; an existing file is never overwritten")
+    p.add_argument("--name", action="append", metavar="NAME", default=[],
+                   help="only the attachment with this name; repeat for several")
+
     p = sub.add_parser("search")
     p.add_argument("query")
     p.add_argument("-n", "--limit", type=bounded_limit, default=LIMIT_DEFAULT)
@@ -710,19 +858,24 @@ def main():
         ).get("data") or []])
         return
 
+    if a.cmd == "attachments":
+        folder, _ = locate(aid, a.message_id, a.folder)
+        if a.save:
+            out({"messageId": a.message_id, "folderId": folder,
+                 "saved": save_attachments(aid, folder, a.message_id, a.save, a.name)})
+        else:
+            if a.name:
+                die("--name selects what --save downloads; pass --save DIR as well")
+            out({"messageId": a.message_id, "folderId": folder,
+                 "attachments": list_attachments(aid, folder, a.message_id)})
+        return
+
     if a.cmd == "read":
         # The content endpoint returns exactly two fields, `content` and `messageId` --
         # no headers at all. Reading subject/from off it gave null on every message,
         # so the headers come from the summary view, which is also where the
         # folderId lookup happens. One scan serves both.
-        folder, head = a.folder, None
-        for m in (api(f"/accounts/{aid}/messages/view", {"limit": MESSAGE_LOOKUP_WINDOW, "start": 1}).get("data") or []):
-            if str(m.get("messageId")) == str(a.message_id):
-                head, folder = m, folder or m.get("folderId")
-                break
-        if not folder:
-            die(f"message {a.message_id} not in the newest {MESSAGE_LOOKUP_WINDOW}; "
-                f"pass -F <folderId>")
+        folder, head = locate(aid, a.message_id, a.folder)
 
         raw = (api(f"/accounts/{aid}/folders/{folder}/messages/{a.message_id}/content")
                .get("data") or {}).get("content") or ""
@@ -745,6 +898,7 @@ def main():
             "to": (head or {}).get("toAddress"),
             "cc": (head or {}).get("ccAddress"),
             "received": summary(head)["received"] if head else None,
+            "hasAttachment": summary(head).get("hasAttachment") if head else None,
             "body_chars": full,
             "truncated": truncated,
             "body": body,

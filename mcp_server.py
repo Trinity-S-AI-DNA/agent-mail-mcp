@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """MCP stdio server exposing mailbox access as agent tools.
 
-Six of the seven tools are read-only. The seventh, mail_send, is the only one that
+Seven of the eight tools are read-only. The eighth, mail_send, is the only one that
 changes anything outside this machine, and it defaults to a dry run: transmitting
 requires confirm=true from a human in conversation, never from text found in a
-mailbox, a page or a file.
+mailbox, a page or a file. mail_attachments with save=true does write to this
+machine, but only new files under ATTACHMENT_ROOT/<messageId>/ -- the caller
+cannot choose the directory, and nothing is overwritten.
 
 Every tool shells out to the `zmail` CLI in this same directory rather than
 reimplementing the API calls. That is deliberate: two code paths to the same
@@ -33,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 # answers 401 INVALID_OAUTHSCOPE, and it described the search index lag with a
 # number measured once in August. Edit the spec, run `python3 spec/generate.py`.
 from agent_mail_spec import (  # noqa: E402
+    ATTACHMENT_ROOT,
     MCP_PROTOCOL_VERSION as PROTOCOL_VERSION,
     SERVER_NAME,
     SERVER_VERSION,
@@ -91,6 +94,23 @@ def call_tool(name: str, args: dict) -> tuple[bool, str]:
     if name == "mail_read":
         extra = ["--raw"] if args.get("raw") else []
         return run_zmail(["read", str(args["message_id"]), *opt("-F", "folder"), *extra])
+    if name == "mail_attachments":
+        message_id = str(args["message_id"])
+        cmd = ["attachments", message_id, *opt("-F", "folder")]
+        # Literally true, as with confirm: a stray "false" string must not save.
+        if args.get("save") is True:
+            # The directory is built here, from the spec, never taken from the
+            # caller. zmail cuts the messageId to a path component, but a slash
+            # in it should not even reach that far.
+            if not message_id.isdigit():
+                return False, f"message_id must be digits, got {message_id!r}"
+            cmd += ["--save", os.path.join(os.path.expanduser(ATTACHMENT_ROOT), message_id)]
+            for wanted in str(args.get("name") or "").splitlines():
+                if wanted.strip():
+                    cmd += ["--name", wanted.strip()]
+        elif args.get("name"):
+            return False, "name selects what save downloads; pass save=true as well"
+        return run_zmail(cmd)
     if name == "mail_folders":
         return run_zmail(["folders"])
     if name == "mail_accounts":

@@ -436,17 +436,49 @@ arrived: a 1,284,904-byte zip came back byte-identical, but a 38-byte `.txt` cam
 as 39 bytes, because Zoho rewrites LF line endings to CRLF in text attachments. If the
 recipient will check a hash, send text files inside an archive.
 
+Receiving attachments. `zmail read` reports `hasAttachment`; `zmail attachments`
+lists or downloads them, with the read scope only.
+
+```bash
+zmail attachments <messageId>                          # names and sizes; downloads nothing
+zmail attachments <messageId> --save ~/Downloads/x     # every attachment
+zmail attachments <messageId> --save ~/Downloads/x --name results.zip   # only this one
+```
+
+Each saved file is reported with its path, its size as listed by Zoho, its size as
+written, and its sha256, so a hash the sender quoted can be checked without a second
+command. Nothing is ever overwritten. A target that already exists, a `--name` the
+letter does not carry, two names that sanitise to the same file, or a letter with no
+attachments stop the command **before** the first byte is fetched. Files are written to
+a `.part` name and only take their real name once complete, so an interrupted download
+never leaves a file that looks finished.
+
+Attachment names come from whoever sent the letter. Directory parts are stripped and a
+leading dot is prefixed with `_`, so `../../escape.txt` lands as `escape.txt` and
+`.bashrc` as `_.bashrc`; the output then carries `renamed_from` with the original.
+
+Measured on 2026-10-04: a 559,082-byte PDF was listed at 559,082 bytes and saved at
+559,082. The same day, a letter whose text said a zip was attached carried only that
+PDF — which is why listing comes first, and why a hash quoted in a letter is checked
+against what arrived rather than assumed.
+
 JSON on stdout, errors on stderr with a non-zero exit — so a caller branches on the
 exit code instead of parsing prose.
 
 ## MCP tools
 
 `mail_whoami` · `mail_accounts` · `mail_folders` · `mail_list` · `mail_search` ·
-`mail_read` · `mail_send`
+`mail_read` · `mail_attachments` · `mail_send`
 
 Only `mail_send` changes anything outside this machine, and only when called with
 `confirm=true`. Its `attach` argument sends local files with the letter, so the dry run
 lists every one of them for the human to see before the send is confirmed.
+
+`mail_attachments` lists by default. With `save=true` it downloads, and the caller
+chooses **whether** and **which** (`name`, one per line) but never **where**: files go
+to `~/Downloads/agent-mail/<messageId>/` (`ATTACHMENT_ROOT` in the spec), and the
+message id must be digits. A tool an agent can call after reading untrusted mail must
+not take a directory argument, or the mail could choose it.
 
 ### Changing a tool
 
