@@ -1,5 +1,5 @@
 // ============================================================================
-// agent-mail — the MCP mail server's surface and its laws, in t27.
+// agent-mail -- the MCP mail server's surface and its laws, in t27.
 //
 // THIS FILE IS THE SOURCE. `spec/generate.py` reads it through
 // `t27c parse --json` and writes `agent_mail_spec.py`, which is imported by
